@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="SOLV — CD L2 Ticket Dashboard",
+    page_title="SOLV — L2 Bucket Ticket Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -113,6 +113,30 @@ def safe_pct(num, den):
 REQUIRED = ["Ticket ID", "Group", "Status", "Created time",
             "Closed time", "Resolution time (in hrs)"]
 
+
+# ============================================================
+# SOLV GROUP BUCKETS
+# ============================================================
+L2_GROUPS = {
+    "ops - l2",
+    "cd - seller support",
+    "tech support",
+    "logistics",
+    "l2 bucket",
+}
+
+L1_GROUPS = {
+    "cd l1 team",
+    "no group",
+}
+
+def is_l2_group(series):
+    return clean_text(series).str.casefold().isin(L2_GROUPS)
+
+def is_l1_group(series):
+    return clean_text(series).str.casefold().isin(L1_GROUPS)
+
+
 def prepare_data(raw):
     df = raw.copy()
 
@@ -127,6 +151,9 @@ def prepare_data(raw):
     df["Ticket ID"] = df["Ticket ID"].astype(str).str.strip()
     df["_Group"] = clean_text(df["Group"]).replace("", "No Group")
     df["_Status"] = clean_text(df["Status"]).str.upper()
+
+    df["_IsL2"] = df["_Group"].str.casefold().isin(L2_GROUPS)
+    df["_IsL1"] = df["_Group"].str.casefold().isin(L1_GROUPS)
 
     # Treat Resolved as closed for resolution/SLA metrics because it has a
     # resolved state but may not have a Closed time.
@@ -208,11 +235,11 @@ def cd_l1_analysis(data):
         )
     ]
 
-    # Current CD L2 is visible in the raw Group field, but the single
+    # Current L2 Bucket is visible in the raw Group field, but the single
     # snapshot does not contain historical Group movement. Therefore this
-    # metric is explicitly "currently in CD L2", not a proven movement count.
+    # metric is explicitly "currently in L2 Bucket", not a proven movement count.
     l2_current = data[
-        data["_Group"].fillna("").astype(str).str.casefold().eq("cd l2")
+        data["_Group"].fillna("").astype(str).str.casefold().eq("l2 bucket")
     ]
 
     l1_open = l1[~l1["_ClosedLike"]]
@@ -499,8 +526,8 @@ def category_subcategory_table(data):
 
 
 def other_group_pending_table(data):
-    """Current tickets whose raw Group is not CD L2, with aging/SLA status, after the dashboard filters are applied."""
-    x = data[~data["_Group"].str.casefold().eq("cd l2")].copy()
+    """Current tickets whose raw Group is not L2 Bucket, with aging/SLA status, after the dashboard filters are applied."""
+    x = data[~data["_Group"].str.casefold().eq("l2 bucket")].copy()
     if x.empty:
         return pd.DataFrame(columns=[
             "Current Group", "Tickets", "Open / Pending",
@@ -529,9 +556,9 @@ def other_group_pending_table(data):
 
 
 def other_group_agent_pending_table(data):
-    """Agent-level view of currently open/pending tickets outside CD L2."""
+    """Agent-level view of currently open/pending tickets outside L2 Bucket."""
     x = data[
-        ~data["_Group"].str.casefold().eq("cd l2") &
+        ~data["_Group"].str.casefold().eq("l2 bucket") &
         ~data["_ClosedLike"]
     ].copy()
 
@@ -567,9 +594,9 @@ def other_group_agent_pending_table(data):
 
 
 def other_group_ticket_detail_table(data):
-    """Ticket-level details for currently open/pending tickets outside CD L2."""
+    """Ticket-level details for currently open/pending tickets outside L2 Bucket."""
     x = data[
-        ~data["_Group"].str.casefold().eq("cd l2") &
+        ~data["_Group"].str.casefold().eq("l2 bucket") &
         ~data["_ClosedLike"]
     ].copy()
 
@@ -720,7 +747,171 @@ def agent_summary_table(data):
     ).reset_index(drop=True)
 
 
-def excel_bytes(raw, cd):
+
+def group_set_for_agent(data, agent):
+    """Return all current groups handled by the selected agent."""
+    if data is None or data.empty or "Agent" not in data.columns:
+        return pd.DataFrame()
+
+    x = data[
+        clean_text(data["Agent"]).eq(agent)
+    ].copy()
+
+    return x
+
+
+def agent_cross_group_summary(data, agent):
+    """Current-group workload for a selected agent across the full dump."""
+    x = group_set_for_agent(data, agent)
+
+    if x.empty:
+        return pd.DataFrame(columns=[
+            "Group", "Tickets", "Open / Pending", "Closed / Resolved",
+            "Open >48h", "Open >90 days", "Avg Resolution",
+            "Max Open Aging"
+        ])
+
+    rows = []
+    for group, g in x.groupby("_Group", sort=False):
+        open_g = g[~g["_ClosedLike"]]
+        closed_g = g[g["_ClosedLike"]]
+        res = closed_g["_ResolutionHours"].dropna()
+        age = open_g["_CurrentAgeHours"].dropna()
+
+        rows.append({
+            "Group": group,
+            "Tickets": unique_ticket_count(g),
+            "Open / Pending": unique_ticket_count(open_g),
+            "Closed / Resolved": unique_ticket_count(closed_g),
+            "Open >48h": int((age > 48).sum()),
+            "Open >90 days": int((age > 2160).sum()),
+            "Avg Resolution": format_hms(res.mean()) if len(res) else "—",
+            "Max Open Aging": format_hms(age.max()) if len(age) else "—",
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["Open >48h", "Tickets"],
+        ascending=False
+    ).reset_index(drop=True)
+
+
+def agent_cross_group_tickets(data, agent, selected_group=None):
+    """Ticket-level cross-group detail for the selected agent."""
+    x = group_set_for_agent(data, agent)
+
+    if selected_group and selected_group != "All":
+        x = x[x["_Group"].eq(selected_group)]
+
+    if x.empty:
+        return pd.DataFrame(columns=[
+            "Group", "Ticket ID", "Status", "Created Date",
+            "Last Updated Date", "Category", "Sub-Category",
+            "Resolution Time", "Current Aging", "Aging Days",
+            "48H SLA", "Open Reason"
+        ])
+
+    out = pd.DataFrame()
+    out["Group"] = x["_Group"]
+    out["Ticket ID"] = x["Ticket ID"]
+    out["Status"] = x["Status"]
+    out["Created Date"] = x["_Created"].dt.strftime("%d %b %Y %H:%M:%S")
+    out["Last Updated Date"] = pd.to_datetime(
+        x["Last update time"], errors="coerce"
+    ).dt.strftime("%d %b %Y %H:%M:%S")
+    out["Category"] = clean_text(x["Category"]).replace("", "(blank)")
+    out["Sub-Category"] = clean_text(x["Sub-Category"]).replace("", "(blank)")
+    out["Resolution Time"] = x["_ResolutionHours"].apply(format_hms)
+
+    out["Current Aging"] = np.where(
+        x["_ClosedLike"],
+        x["_ResolutionHours"].apply(format_hms),
+        x["_CurrentAgeHours"].apply(format_hms)
+    )
+
+    out["Aging Days"] = np.where(
+        x["_ClosedLike"],
+        x["_ResolutionHours"].apply(
+            lambda h: "—" if pd.isna(h) else f"{h/24:.1f} days"
+        ),
+        x["_CurrentAgeHours"].apply(
+            lambda h: "—" if pd.isna(h) else f"{h/24:.1f} days"
+        )
+    )
+
+    out["48H SLA"] = x["_SLA48"]
+    out["Open Reason"] = clean_text(
+        x["Reason for pendency"]
+    ).replace("", "Reason not provided")
+
+    out["_sort_age"] = np.where(
+        x["_ClosedLike"],
+        x["_ResolutionHours"],
+        x["_CurrentAgeHours"]
+    )
+
+    return out.sort_values(
+        "_sort_age",
+        ascending=False
+    ).drop(columns="_sort_age").reset_index(drop=True)
+
+
+def l1_created_to_l2_table(data):
+    """
+    Current-state proxy:
+    - identify CreatedBy names among current L1 groups (CD L1 Team/No Group)
+    - count those same creators among current L2 bucket groups.
+    This cannot prove historical movement because the dump has no movement history.
+    """
+    l1 = data[data["_IsL1"]].copy()
+    l2 = data[data["_IsL2"]].copy()
+
+    if l1.empty or l2.empty:
+        return pd.DataFrame(columns=[
+            "L1 Champ / Created By", "L1 Tickets Raised",
+            "Current L2 Tickets Created By Champ", "L2 Groups"
+        ])
+
+    l1_creator = clean_text(l1["CreatedBy"]).replace(
+        "", "Not provided"
+    )
+    l2_creator = clean_text(l2["CreatedBy"]).replace(
+        "", "Not provided"
+    )
+
+    creator_counts = (
+        l1.assign(_Creator=l1_creator)
+        .groupby("_Creator")["Ticket ID"].nunique()
+        .reset_index(name="L1 Tickets Raised")
+    )
+
+    rows = []
+    for _, row in creator_counts.iterrows():
+        creator = row["_Creator"]
+        created_l2 = l2[
+            l2_creator.eq(creator)
+        ]
+
+        if created_l2.empty:
+            continue
+
+        groups = sorted(
+            clean_text(created_l2["_Group"]).unique().tolist()
+        )
+
+        rows.append({
+            "L1 Champ / Created By": creator,
+            "L1 Tickets Raised": int(row["L1 Tickets Raised"]),
+            "Current L2 Tickets Created By Champ": unique_ticket_count(created_l2),
+            "L2 Groups": ", ".join(groups),
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        "Current L2 Tickets Created By Champ",
+        ascending=False
+    ).reset_index(drop=True)
+
+
+def excel_bytes(raw, l2):
     # Excel report functions use prepared/internal columns such as _Group,
     # _ClosedLike and _CurrentAgeHours. Prepare the full dump first.
     full = prepare_data(raw)
@@ -729,7 +920,7 @@ def excel_bytes(raw, cd):
     
     from openpyxl.utils import get_column_letter
 
-    m=metrics(cd)
+    m=metrics(l2)
     buf=io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         summary=pd.DataFrame([
@@ -750,7 +941,7 @@ def excel_bytes(raw, cd):
         ],columns=["Metric","Value"])
         summary.to_excel(writer,index=False,sheet_name="Summary")
 
-        cd_out=cd[[
+        cd_out=l2[[
             "Ticket ID","Subject","Status","Priority","Type","Agent","Group",
             "Created time","Closed time","Last update time",
             "Resolution time (in hrs)","Resolution status",
@@ -762,16 +953,16 @@ def excel_bytes(raw, cd):
             "_AgingBucket":"Current Aging Bucket",
             "_SLA48":"48H SLA Bucket"
         },inplace=True)
-        cd_out.to_excel(writer,index=False,sheet_name="CD L2 Raw + Analysis")
+        cd_out.to_excel(writer,index=False,sheet_name="L2 Bucket Raw + Analysis")
 
-        aging_table(cd).to_excel(writer,index=False,sheet_name="Ticket Aging")
-        open_reason_table(cd).to_excel(writer,index=False,sheet_name="Open Reasons")
-        issue_breakup_table(cd, "Category").to_excel(writer,index=False,sheet_name="Category Breakup")
-        issue_breakup_table(cd, "Sub-Category").to_excel(writer,index=False,sheet_name="Subcategory Breakup")
-        category_subcategory_table(cd).to_excel(writer,index=False,sheet_name="Category + Subcategory")
+        aging_table(l2).to_excel(writer,index=False,sheet_name="Ticket Aging")
+        open_reason_table(l2).to_excel(writer,index=False,sheet_name="Open Reasons")
+        issue_breakup_table(l2, "Category").to_excel(writer,index=False,sheet_name="Category Breakup")
+        issue_breakup_table(l2, "Sub-Category").to_excel(writer,index=False,sheet_name="Subcategory Breakup")
+        category_subcategory_table(l2).to_excel(writer,index=False,sheet_name="Category + Subcategory")
         other_group_pending_table(full).to_excel(writer,index=False,sheet_name="Other Groups Pending")
-        agent_summary_table(cd).to_excel(writer,index=False,sheet_name="Agent Summary")
-        agent_ticket_detail_table(cd).to_excel(writer,index=False,sheet_name="Agent Ticket Detail")
+        agent_summary_table(l2).to_excel(writer,index=False,sheet_name="Agent Summary")
+        agent_ticket_detail_table(l2).to_excel(writer,index=False,sheet_name="Agent Ticket Detail")
         l1_agent_table(full).to_excel(writer,index=False,sheet_name="CD L1 Agent Summary")
         l1_ticket_detail_table(full).to_excel(writer,index=False,sheet_name="CD L1 Fresh Unassigned")
         fcr_l1_table(full).to_excel(writer,index=False,sheet_name="CD L1 FCR Proxy")
@@ -784,9 +975,9 @@ def excel_bytes(raw, cd):
         group_aging_table(full).to_excel(writer,index=False,sheet_name="All Groups Aging")
         resolution_by_group(full).to_excel(writer,index=False,sheet_name="All Groups Resolution")
 
-        # Monthly view for CD L2
+        # Monthly view for L2 Bucket
         monthly=[]
-        for key,g in cd.groupby("_MonthSort",sort=True):
+        for key,g in l2.groupby("_MonthSort",sort=True):
             mm=metrics(g)
             monthly.append({
                 "Month":g["_Month"].iloc[0],
@@ -802,7 +993,7 @@ def excel_bytes(raw, cd):
                 "99%":format_hms(mm["p99"]),
             })
         pd.DataFrame(monthly).to_excel(writer,index=False,sheet_name="Monthly Trend")
-        week_breakup_table(cd).to_excel(writer,index=False,sheet_name="Weekly Trend")
+        week_breakup_table(l2).to_excel(writer,index=False,sheet_name="Weekly Trend")
 
     wb=load_workbook(buf)
     header_fill=PatternFill("solid",fgColor="173A5E")
@@ -835,7 +1026,7 @@ def excel_bytes(raw, cd):
     red=PatternFill("solid",fgColor="F4CCCC")
     green=PatternFill("solid",fgColor="D9EAD3")
     orange=PatternFill("solid",fgColor="FCE5CD")
-    for wsname in ["CD L2 Raw + Analysis","All Groups Aging","Monthly Trend"]:
+    for wsname in ["L2 Bucket Raw + Analysis","All Groups Aging","Monthly Trend"]:
         ws=wb[wsname]
         for row in ws.iter_rows():
             for cell in row:
@@ -853,19 +1044,19 @@ def excel_bytes(raw, cd):
 # ============================================================
 st.markdown("""
 <div class="hero">
-  <h1>SOLV — CD L2 TICKET PERFORMANCE DASHBOARD</h1>
-  <p>CD L2 bucket health, 48-hour SLA, ticket aging, resolution performance and workload drivers.</p>
+  <h1>SOLV — L2 Bucket TICKET PERFORMANCE DASHBOARD</h1>
+  <p>L2 Bucket bucket health, 48-hour SLA, ticket aging, resolution performance and workload drivers.</p>
 </div>
 """, unsafe_allow_html=True)
 
 uploaded=st.file_uploader(
     "Upload the SOLV ticket dump (CSV / Excel)",
     type=["csv","xlsx","xls"],
-    help="The dashboard analyses the raw Group field and focuses the main KPIs on Group = CD L2."
+    help="The dashboard analyses the raw Group field and focuses the main KPIs on Group = L2 Bucket."
 )
 
 if uploaded is None:
-    st.info("Upload the SOLV ticket dump to start the CD L2 analysis.")
+    st.info("Upload the SOLV ticket dump to start the L2 Bucket analysis.")
     st.stop()
 
 try:
@@ -985,13 +1176,19 @@ if selected_category!="All":
         .eq(selected_category)
     ]
 
-# Main dashboard population remains CD L2 only.
-cd=filtered_all[
-    filtered_all["_Group"].str.casefold().eq("cd l2")
+# Main SOLV dashboard population = all configured L2 groups:
+# Ops - L2, CD - Seller Support, Tech Support, Logistics, L2 Bucket.
+l2=filtered_all[
+    filtered_all["_IsL2"]
+].copy()
+
+# L1 visibility is separate: CD L1 Team + No Group.
+l1=filtered_all[
+    filtered_all["_IsL1"]
 ].copy()
 
 st.caption(
-    f"Showing {unique_ticket_count(cd):,} CD L2 tickets"
+    f"Showing {unique_ticket_count(l2):,} L2 Bucket tickets"
     + (f" | Month: {selected_month}" if selected_month!="All" else " | All available months")
     + (f" | Week: {selected_week}" if selected_week!="All" else "")
     + (f" | Day: {selected_day}" if selected_day!="All" else "")
@@ -999,8 +1196,8 @@ st.caption(
     + (f" | Category: {selected_category}" if selected_category!="All" else "")
 )
 
-if cd.empty:
-    st.warning("No CD L2 tickets match the selected filters.")
+if l2.empty:
+    st.warning("No L2 Bucket tickets match the selected filters.")
     st.stop()
 
 # ============================================================
@@ -1020,8 +1217,8 @@ with q2:
     kpi("L1 CLOSED SAME DAY", f"{l1a['l1_closed_same_day']:,}", "green",
         "Created date = Closed date")
 with q3:
-    kpi("CURRENTLY IN CD L2", f"{l1a['l1_current_l2']:,}", "orange",
-        "Current Group = CD L2; movement history is not available")
+    kpi("CURRENTLY IN L2 Bucket", f"{l1a['l1_current_l2']:,}", "orange",
+        "Current Group = L2 Bucket; movement history is not available")
 with q4:
     kpi("L1 FRESH & UNASSIGNED <48H", f"{l1a['l1_fresh_unassigned']:,}", "red",
         "Open/pending + no agent + age <48h")
@@ -1039,8 +1236,8 @@ with q8:
 
 st.caption(
     "Important: the raw dump contains the current Group only. Therefore "
-    "\"Currently in CD L2\" is a current-state count, not proof of historical "
-    "movement from CD L1 to CD L2. A true FCR cannot be proven because this "
+    "\"Currently in L2 Bucket\" is a current-state count, not proof of historical "
+    "movement from CD L1 to L2 Bucket. A true FCR cannot be proven because this "
     "dump does not contain Call ID/contact history; the same-day Phone number "
     "is shown only as an operational proxy."
 )
@@ -1066,13 +1263,115 @@ st.dataframe(
 )
 
 # ============================================================
+# L1 VISIBILITY
+# ============================================================
+st.markdown(
+    '<div class="section">L1 VISIBILITY — CD L1 TEAM + NO GROUP</div>',
+    unsafe_allow_html=True
+)
+
+l1_total = unique_ticket_count(l1)
+l1_open = unique_ticket_count(l1[~l1["_ClosedLike"]])
+l1_unassigned = l1[
+    (~l1["_ClosedLike"]) &
+    clean_text(l1["Agent"]).str.casefold().isin(["", "no agent", "not provided"])
+]
+l1_fresh_unassigned = l1_unassigned[
+    l1_unassigned["_CurrentAgeHours"].notna() &
+    (l1_unassigned["_CurrentAgeHours"] < 48)
+]
+
+l1q1,l1q2,l1q3,l1q4=st.columns(4)
+with l1q1:
+    kpi("L1 TICKETS", f"{l1_total:,}", "blue")
+with l1q2:
+    kpi("L1 OPEN / PENDING", f"{l1_open:,}", "red")
+with l1q3:
+    kpi("L1 FRESH & UNASSIGNED <48H", f"{unique_ticket_count(l1_fresh_unassigned):,}", "orange")
+with l1q4:
+    kpi("L1 CURRENT L2 TICKETS", f"{unique_ticket_count(l2[l2['CreatedBy'].isin(l1['CreatedBy'].dropna())]):,}", "green",
+        "Current-state CreatedBy proxy; not historical movement")
+
+st.markdown("**L1-created / current-L2 proxy by Created By**")
+st.dataframe(
+    l1_created_to_l2_table(filtered_all),
+    use_container_width=True,
+    hide_index=True
+)
+
+st.caption(
+    "L1 = current Group 'CD L1 Team' or 'No Group'. "
+    "L1 → L2 is shown as a current-state CreatedBy proxy because this raw dump "
+    "does not contain Group movement history."
+)
+
+# ============================================================
+# AGENT CROSS-GROUP DRILLDOWN
+# ============================================================
+st.markdown(
+    '<div class="section">AGENT CROSS-GROUP WORKLOAD — ALL GROUPS</div>',
+    unsafe_allow_html=True
+)
+
+all_agents = sorted(
+    clean_text(filtered_all["Agent"])
+    .replace("", "No Agent")
+    .unique()
+    .tolist()
+)
+
+if all_agents:
+    selected_agent = st.selectbox(
+        "Select agent / champ",
+        all_agents
+    )
+
+    agent_all = group_set_for_agent(filtered_all, selected_agent)
+    st.caption(
+        f"{selected_agent} currently has "
+        f"{unique_ticket_count(agent_all):,} tickets across "
+        f"{agent_all['_Group'].nunique():,} group(s)."
+    )
+
+    agent_summary = agent_cross_group_summary(
+        filtered_all,
+        selected_agent
+    )
+    st.dataframe(
+        agent_summary,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    group_choices = ["All"] + sorted(agent_all["_Group"].unique().tolist())
+    selected_agent_group = st.selectbox(
+        "Expand / inspect group for selected agent",
+        group_choices
+    )
+
+    agent_detail = agent_cross_group_tickets(
+        filtered_all,
+        selected_agent,
+        selected_agent_group
+    )
+
+    with st.expander(
+        f"View {selected_agent}'s ticket details"
+    ):
+        st.dataframe(
+            agent_detail,
+            use_container_width=True,
+            hide_index=True
+        )
+
+# ============================================================
 # SUMMARY
 # ============================================================
-m=metrics(cd)
-st.markdown('<div class="section">SUMMARY — CD L2</div>',unsafe_allow_html=True)
+m=metrics(l2)
+st.markdown('<div class="section">SUMMARY — L2 Bucket</div>',unsafe_allow_html=True)
 
 r1=st.columns(4)
-with r1[0]: kpi("TICKETS IN CD L2",f"{m['raised']:,}","blue","Total tickets raised in CD L2")
+with r1[0]: kpi("TICKETS IN L2 Bucket",f"{m['raised']:,}","blue","Total tickets raised in L2 Bucket")
 with r1[1]: kpi("CLOSED / RESOLVED",f"{m['closed']:,}","green","Closed or resolved tickets")
 with r1[2]: kpi("OPEN / PENDING",f"{m['open']:,}","red","Current unresolved workload")
 with r1[3]: kpi("OPEN / PENDING >48H",f"{m['open_gt48']:,}","orange","Current tickets older than 48h")
@@ -1090,7 +1389,7 @@ with r3[2]: kpi("MAX CURRENT AGE",format_hms(m["max_open_age"]),"red","Oldest op
 with r3[3]: kpi("VALID RESOLUTION TICKETS",f"{m['valid_resolution']:,}","dark","Used for average and percentiles")
 
 st.caption(
-    "48H Closure % is calculated against total CD L2 tickets raised in the selected population. "
+    "48H Closure % is calculated against total L2 Bucket tickets raised in the selected population. "
     "Resolution-time metrics use valid closed/resolved tickets and the raw 'Resolution time (in hrs)' field."
 )
 
@@ -1112,22 +1411,22 @@ st.caption(
 # OPEN REASONS
 # ============================================================
 st.markdown('<div class="section">OPEN / PENDING REASONS</div>',unsafe_allow_html=True)
-orows=open_reason_table(cd)
+orows=open_reason_table(l2)
 st.dataframe(orows,use_container_width=True,hide_index=True)
 
 # ============================================================
 # CATEGORY / SUB-CATEGORY ANALYSIS
 # ============================================================
 st.markdown('<div class="section">CATEGORY-WISE BREAKUP</div>',unsafe_allow_html=True)
-cat_tbl = issue_breakup_table(cd, "Category")
+cat_tbl = issue_breakup_table(l2, "Category")
 st.dataframe(cat_tbl, use_container_width=True, hide_index=True)
 
 st.markdown('<div class="section">SUB-CATEGORY-WISE BREAKUP</div>',unsafe_allow_html=True)
-sub_tbl = issue_breakup_table(cd, "Sub-Category")
+sub_tbl = issue_breakup_table(l2, "Sub-Category")
 st.dataframe(sub_tbl, use_container_width=True, hide_index=True)
 
 st.markdown('<div class="section">CATEGORY + SUB-CATEGORY CONTRIBUTION</div>',unsafe_allow_html=True)
-cs_tbl = category_subcategory_table(cd)
+cs_tbl = category_subcategory_table(l2)
 st.dataframe(cs_tbl, use_container_width=True, hide_index=True)
 
 # ============================================================
@@ -1135,9 +1434,9 @@ st.dataframe(cs_tbl, use_container_width=True, hide_index=True)
 # ============================================================
 st.markdown('<div class="section">CURRENT TICKETS IN OTHER GROUPS</div>',unsafe_allow_html=True)
 st.caption(
-    "Based only on the raw Group column. CD L2 remains the main dashboard "
+    "Based only on the raw Group column. L2 Bucket remains the main dashboard "
     "population. This separate view shows tickets currently sitting in any "
-    "group other than CD L2, including open/pending aging."
+    "group other than L2 Bucket, including open/pending aging."
 )
 other_tbl = other_group_pending_table(filtered_all)
 st.dataframe(other_tbl, use_container_width=True, hide_index=True)
@@ -1147,10 +1446,10 @@ st.dataframe(other_tbl, use_container_width=True, hide_index=True)
 # ============================================================
 st.markdown('<div class="section">AGENT-WISE TICKET OWNERSHIP & RESOLUTION</div>',unsafe_allow_html=True)
 st.caption(
-    "Shows which agent is handling the selected CD L2 tickets, how many they "
+    "Shows which agent is handling the selected L2 Bucket tickets, how many they "
     "have, their open/closed workload, aging and resolution time."
 )
-agent_sum = agent_summary_table(cd)
+agent_sum = agent_summary_table(l2)
 st.dataframe(agent_sum, use_container_width=True, hide_index=True)
 
 st.markdown('<div class="section">AGENT / TICKET-LEVEL DETAIL</div>',unsafe_allow_html=True)
@@ -1158,7 +1457,7 @@ st.caption(
     "Ticket-level view: Agent, Group, Ticket ID, Created Date, Last Updated Date, "
     "Category, Sub-Category, resolution/aging time and 48-hour status."
 )
-agent_detail = agent_ticket_detail_table(cd)
+agent_detail = agent_ticket_detail_table(l2)
 st.dataframe(agent_detail, use_container_width=True, hide_index=True)
 
 # ============================================================
@@ -1169,8 +1468,8 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.caption(
-    "Separate from the CD L2 KPIs. This view shows currently open/pending "
-    "tickets whose raw Group is not CD L2, grouped by agent and destination group."
+    "Separate from the L2 Bucket KPIs. This view shows currently open/pending "
+    "tickets whose raw Group is not L2 Bucket, grouped by agent and destination group."
 )
 other_agent_tbl = other_group_agent_pending_table(filtered_all)
 st.dataframe(other_agent_tbl, use_container_width=True, hide_index=True)
@@ -1188,14 +1487,14 @@ st.dataframe(other_detail_tbl, use_container_width=True, hide_index=True)
 st.markdown('<div class="section">CURRENT TICKET AGING</div>',unsafe_allow_html=True)
 st.caption("For open/pending tickets, aging is measured from Created time to the current dashboard refresh time.")
 
-ag=aging_table(cd)
+ag=aging_table(l2)
 st.dataframe(ag,use_container_width=True,hide_index=True)
 
 # ============================================================
 # GROUP TICKETING AGING
 # ============================================================
 st.markdown('<div class="section">GROUP TICKETING AGING — FULL DUMP</div>',unsafe_allow_html=True)
-st.caption("This view uses the raw Group field across the complete dump, so you can see where the overall workload sits. Main KPIs above remain CD L2 only.")
+st.caption("This view uses the raw Group field across the complete dump, so you can see where the overall workload sits. Main KPIs above remain L2 Bucket only.")
 ga=group_aging_table(df)
 st.dataframe(ga,use_container_width=True,hide_index=True)
 
@@ -1209,16 +1508,16 @@ st.dataframe(gr,use_container_width=True,hide_index=True)
 # ============================================================
 # WEEKLY TREND
 # ============================================================
-st.markdown('<div class="section">WEEK-WISE CD L2 BREAKUP</div>',unsafe_allow_html=True)
-weekly_df = week_breakup_table(cd)
+st.markdown('<div class="section">WEEK-WISE L2 Bucket BREAKUP</div>',unsafe_allow_html=True)
+weekly_df = week_breakup_table(l2)
 st.dataframe(weekly_df, use_container_width=True, hide_index=True)
 
 # ============================================================
 # MONTHLY TREND
 # ============================================================
-st.markdown('<div class="section">MONTH-WISE CD L2 BREAKUP</div>',unsafe_allow_html=True)
+st.markdown('<div class="section">MONTH-WISE L2 Bucket BREAKUP</div>',unsafe_allow_html=True)
 monthly=[]
-for key,g in cd.groupby("_MonthSort",sort=True):
+for key,g in l2.groupby("_MonthSort",sort=True):
     mm=metrics(g)
     monthly.append({
         "Month":g["_Month"].iloc[0],
@@ -1241,16 +1540,16 @@ st.dataframe(monthly_df,use_container_width=True,hide_index=True)
 # ============================================================
 st.markdown('<div class="section">DOWNLOAD REPORT</div>',unsafe_allow_html=True)
 st.caption(
-    "The Excel report contains CD L2 raw data with analysis columns, "
+    "The Excel report contains L2 Bucket raw data with analysis columns, "
     "category/sub-category breakups, open reasons, ticket aging, other-group "
     "pending tickets, group aging, group resolution, weekly and monthly trends. "
     "Every main table has Excel filters enabled."
 )
 
 try:
-    xlsx=excel_bytes(raw,cd)
+    xlsx=excel_bytes(raw,l2)
     st.download_button(
-        "⬇️ Download CD L2 Analysis Excel",
+        "⬇️ Download L2 Bucket Analysis Excel",
         data=xlsx,
         file_name="SOLV_CD_L2_Ticket_Analysis.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
