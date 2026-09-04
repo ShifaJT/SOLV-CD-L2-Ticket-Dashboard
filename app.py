@@ -923,6 +923,21 @@ def excel_bytes(raw, l2):
     m=metrics(l2)
     buf=io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        overall_total = unique_ticket_count(full)
+        overall_closed = unique_ticket_count(full[full["_ClosedLike"]])
+        overall_open = unique_ticket_count(full[~full["_ClosedLike"]])
+
+        overall_summary = pd.DataFrame([
+            ["Overall Tickets Raised", overall_total],
+            ["Overall Closed / Resolved", overall_closed],
+            ["Overall Open / Pending", overall_open],
+        ], columns=["Metric", "Count"])
+        overall_summary.to_excel(
+            writer,
+            index=False,
+            sheet_name="Overall Summary"
+        )
+
         summary=pd.DataFrame([
             ["Tickets Raised",m["raised"]],
             ["Closed / Resolved",m["closed"]],
@@ -1258,6 +1273,76 @@ st.markdown(
 )
 st.dataframe(
     l1_ticket_detail_table(filtered_all),
+    use_container_width=True,
+    hide_index=True
+)
+
+# ============================================================
+# OVERALL TICKET SUMMARY — FULL DUMP
+# ============================================================
+st.markdown(
+    '<div class="section">OVERALL TICKET SUMMARY — FULL DUMP</div>',
+    unsafe_allow_html=True
+)
+
+overall_total = unique_ticket_count(filtered_all)
+overall_closed = unique_ticket_count(
+    filtered_all[filtered_all["_ClosedLike"]]
+)
+overall_open = unique_ticket_count(
+    filtered_all[~filtered_all["_ClosedLike"]]
+)
+
+overall_q1, overall_q2, overall_q3 = st.columns(3)
+
+with overall_q1:
+    kpi(
+        "OVERALL TICKETS RAISED",
+        f"{overall_total:,}",
+        "blue",
+        "All groups in the selected filter scope"
+    )
+
+with overall_q2:
+    kpi(
+        "OVERALL CLOSED / RESOLVED",
+        f"{overall_closed:,}",
+        "green",
+        "All groups in the selected filter scope"
+    )
+
+with overall_q3:
+    kpi(
+        "OVERALL OPEN / PENDING",
+        f"{overall_open:,}",
+        "red",
+        "All groups in the selected filter scope"
+    )
+
+overall_status = pd.DataFrame([
+    {
+        "Metric": "Overall Tickets Raised",
+        "Count": overall_total,
+        "% of Total": 100.0 if overall_total else 0.0,
+    },
+    {
+        "Metric": "Overall Closed / Resolved",
+        "Count": overall_closed,
+        "% of Total": round(
+            overall_closed / overall_total * 100, 1
+        ) if overall_total else 0.0,
+    },
+    {
+        "Metric": "Overall Open / Pending",
+        "Count": overall_open,
+        "% of Total": round(
+            overall_open / overall_total * 100, 1
+        ) if overall_total else 0.0,
+    },
+])
+
+st.dataframe(
+    overall_status,
     use_container_width=True,
     hide_index=True
 )
