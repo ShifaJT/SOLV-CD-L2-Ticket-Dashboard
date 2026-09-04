@@ -185,6 +185,183 @@ def prepare_data(raw):
 
     return df
 
+
+def status_is_closed(df):
+    return df["_ClosedLike"]
+
+
+def cd_l1_analysis(data):
+    """CD L1 intake and handoff analysis from the current raw Group snapshot."""
+    l1 = data[
+        data["_Group"].fillna("").astype(str).str.casefold().eq("cd l1 team")
+    ].copy()
+
+    total = unique_ticket_count(l1)
+
+    closed = l1[l1["_ClosedLike"]]
+    created = pd.to_datetime(l1["_Created"], errors="coerce")
+    closed_time = pd.to_datetime(l1["_Closed"], errors="coerce")
+
+    same_day = closed[
+        created.loc[closed.index].dt.date.eq(
+            closed_time.loc[closed.index].dt.date
+        )
+    ]
+
+    # Current CD L2 is visible in the raw Group field, but the single
+    # snapshot does not contain historical Group movement. Therefore this
+    # metric is explicitly "currently in CD L2", not a proven movement count.
+    l2_current = data[
+        data["_Group"].fillna("").astype(str).str.casefold().eq("cd l2")
+    ]
+
+    l1_open = l1[~l1["_ClosedLike"]]
+    unassigned = clean_text(l1_open["Agent"]).str.casefold().isin(
+        ["", "no agent", "not provided"]
+    )
+    fresh_unassigned = l1_open[
+        unassigned &
+        l1_open["_CurrentAgeHours"].notna() &
+        (l1_open["_CurrentAgeHours"] < 48)
+    ]
+
+    phone_l1_closed = closed[
+        clean_text(closed["Source"]).str.casefold().eq("phone") &
+        created.loc[closed.index].dt.date.eq(
+            closed_time.loc[closed.index].dt.date
+        )
+    ]
+
+    return {
+        "l1_raised": total,
+        "l1_closed_same_day": unique_ticket_count(same_day),
+        "l1_current_l2": unique_ticket_count(l2_current),
+        "l1_open": unique_ticket_count(l1_open),
+        "l1_fresh_unassigned": unique_ticket_count(fresh_unassigned),
+        "same_day_phone_proxy": unique_ticket_count(phone_l1_closed),
+        "l1": l1,
+        "fresh_unassigned": fresh_unassigned,
+    }
+
+
+def l1_agent_table(data):
+    a = cd_l1_analysis(data)
+    l1 = a["l1"]
+
+    if l1.empty:
+        return pd.DataFrame(columns=[
+            "Agent","Tickets Raised","Closed / Resolved","Open / Pending",
+            "Closed Same Day","Open <48h & Unassigned","Avg Resolution",
+            "Max Resolution"
+        ])
+
+    rows = []
+    for agent, g in l1.groupby(
+        clean_text(l1["Agent"]).replace("", "No Agent"),
+        sort=False
+    ):
+        r = g.loc[g["_ClosedLike"], "_ResolutionHours"].dropna()
+        created = g["_Created"]
+        closed = g["_Closed"]
+        same_day_count = int(
+            (
+                g["_ClosedLike"] &
+                created.notna() &
+                closed.notna() &
+                created.dt.date.eq(closed.dt.date)
+            ).sum()
+        )
+        open_g = g[~g["_ClosedLike"]]
+        age = open_g["_CurrentAgeHours"].dropna()
+        fresh_unassigned = open_g[
+            clean_text(open_g["Agent"]).str.casefold().isin(
+                ["", "no agent", "not provided"]
+            )
+            & open_g["_CurrentAgeHours"].notna()
+            & (open_g["_CurrentAgeHours"] < 48)
+        ]
+
+        rows.append({
+            "Agent": agent,
+            "Tickets Raised": unique_ticket_count(g),
+            "Closed / Resolved": unique_ticket_count(g[g["_ClosedLike"]]),
+            "Open / Pending": unique_ticket_count(open_g),
+            "Closed Same Day": same_day_count,
+            "Open <48h & Unassigned": unique_ticket_count(fresh_unassigned),
+            "Avg Resolution": format_hms(r.mean()) if len(r) else "—",
+            "Max Resolution": format_hms(r.max()) if len(r) else "—",
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["Open <48h & Unassigned", "Tickets Raised"],
+        ascending=False
+    ).reset_index(drop=True)
+
+
+def fcr_l1_table(data):
+    """
+    FCR cannot be proven from this dump because there is no Call ID /
+    contact-history field. Show a transparent same-day Phone proxy only.
+    """
+    a = cd_l1_analysis(data)
+    l1 = a["l1"]
+
+    if l1.empty:
+        return pd.DataFrame(columns=[
+            "Metric","Tickets","Definition"
+        ])
+
+    return pd.DataFrame([
+        [
+            "L1 tickets raised",
+            a["l1_raised"],
+            "Current Group = CD L1 Team"
+        ],
+        [
+            "L1 closed same day",
+            a["l1_closed_same_day"],
+            "Created date = Closed date"
+        ],
+        [
+            "Same-day Phone resolution proxy",
+            a["same_day_phone_proxy"],
+            "Phone source + closed on the same calendar day; not a proven FCR"
+        ],
+    ])
+
+
+def l1_ticket_detail_table(data):
+    a = cd_l1_analysis(data)
+    x = a["fresh_unassigned"].copy()
+
+    if x.empty:
+        return pd.DataFrame(columns=[
+            "Agent","Group","Ticket ID","Created Date",
+            "Last Updated Date","Aging","Aging Days",
+            "Category","Sub-Category","Status"
+        ])
+
+    out = pd.DataFrame()
+    out["Agent"] = clean_text(x["Agent"]).replace("", "No Agent")
+    out["Group"] = x["_Group"]
+    out["Ticket ID"] = x["Ticket ID"]
+    out["Created Date"] = x["_Created"].dt.strftime("%d %b %Y %H:%M:%S")
+    out["Last Updated Date"] = pd.to_datetime(
+        x["Last update time"], errors="coerce"
+    ).dt.strftime("%d %b %Y %H:%M:%S")
+    out["Aging"] = x["_CurrentAgeHours"].apply(format_hms)
+    out["Aging Days"] = x["_CurrentAgeHours"].apply(
+        lambda h: "—" if pd.isna(h) else f"{h/24:.1f} days"
+    )
+    out["Category"] = clean_text(x["Category"]).replace("", "(blank)")
+    out["Sub-Category"] = clean_text(x["Sub-Category"]).replace("", "(blank)")
+    out["Status"] = x["Status"]
+
+    return out.sort_values(
+        "Aging", ascending=False
+    ).reset_index(drop=True)
+
+
 def metrics(data):
     raised = unique_ticket_count(data)
     closed = unique_ticket_count(data[data["_ClosedLike"]])
@@ -549,7 +726,7 @@ def excel_bytes(raw, cd):
     full = prepare_data(raw)
     from openpyxl import load_workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.worksheet.table import Table, TableStyleInfo
+    
     from openpyxl.utils import get_column_letter
 
     m=metrics(cd)
@@ -575,8 +752,9 @@ def excel_bytes(raw, cd):
 
         cd_out=cd[[
             "Ticket ID","Subject","Status","Priority","Type","Agent","Group",
-            "Created time","Closed time","Resolution time (in hrs)",
-            "Resolution status","Reason for pendency","Category","Sub-Category",
+            "Created time","Closed time","Last update time",
+            "Resolution time (in hrs)","Resolution status",
+            "Reason for pendency","Category","Sub-Category",
             "_CurrentAgeHours","_AgingBucket","_SLA48"
         ]].copy()
         cd_out.rename(columns={
@@ -594,6 +772,9 @@ def excel_bytes(raw, cd):
         other_group_pending_table(full).to_excel(writer,index=False,sheet_name="Other Groups Pending")
         agent_summary_table(cd).to_excel(writer,index=False,sheet_name="Agent Summary")
         agent_ticket_detail_table(cd).to_excel(writer,index=False,sheet_name="Agent Ticket Detail")
+        l1_agent_table(full).to_excel(writer,index=False,sheet_name="CD L1 Agent Summary")
+        l1_ticket_detail_table(full).to_excel(writer,index=False,sheet_name="CD L1 Fresh Unassigned")
+        fcr_l1_table(full).to_excel(writer,index=False,sheet_name="CD L1 FCR Proxy")
         other_group_agent_pending_table(full).to_excel(
             writer,index=False,sheet_name="Other Group Agent Pending"
         )
@@ -646,16 +827,8 @@ def excel_bytes(raw, cd):
                 if cell.value is not None:
                     maxlen=max(maxlen,len(str(cell.value)))
             ws.column_dimensions[letter].width=min(max(maxlen+2,12),42)
-
-        # Add an Excel table when there is data.
-        if ws.max_row >= 2 and ws.max_column >= 1:
-            ref=f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
-            name="Tbl"+re.sub(r"[^A-Za-z0-9]","",ws.title)[:20]
-            if name[3:].isdigit():
-                name += "X"
-            tab=Table(displayName=name,ref=ref)
-            tab.tableStyleInfo=TableStyleInfo(name="TableStyleMedium2",showFirstColumn=False,showLastColumn=False,rowStripes=True,rowBorders=True)
-            ws.add_table(tab)
+        # Excel AutoFilter keeps the downloaded tables filterable without
+        # requiring openpyxl TableStyleInfo compatibility.
 
     # Conditional formatting for useful SLA/aging columns.
     from openpyxl.formatting.rule import CellIsRule
@@ -829,6 +1002,68 @@ st.caption(
 if cd.empty:
     st.warning("No CD L2 tickets match the selected filters.")
     st.stop()
+
+# ============================================================
+# CD L1 — INTAKE / SAME-DAY / HANDOFF
+# ============================================================
+st.markdown(
+    '<div class="section">CD L1 — INTAKE, SAME-DAY & L2 HANDOFF</div>',
+    unsafe_allow_html=True
+)
+l1a = cd_l1_analysis(filtered_all)
+
+q1,q2,q3,q4 = st.columns(4)
+with q1:
+    kpi("CD L1 TICKETS RAISED", f"{l1a['l1_raised']:,}", "blue",
+        "Current Group = CD L1 Team")
+with q2:
+    kpi("L1 CLOSED SAME DAY", f"{l1a['l1_closed_same_day']:,}", "green",
+        "Created date = Closed date")
+with q3:
+    kpi("CURRENTLY IN CD L2", f"{l1a['l1_current_l2']:,}", "orange",
+        "Current Group = CD L2; movement history is not available")
+with q4:
+    kpi("L1 FRESH & UNASSIGNED <48H", f"{l1a['l1_fresh_unassigned']:,}", "red",
+        "Open/pending + no agent + age <48h")
+
+q5,q6,q7,q8 = st.columns(4)
+with q5:
+    kpi("L1 OPEN / PENDING", f"{l1a['l1_open']:,}", "red")
+with q6:
+    kpi("L1 SAME-DAY PHONE PROXY", f"{l1a['same_day_phone_proxy']:,}", "green",
+        "Phone + same-day close; not proven FCR")
+with q7:
+    kpi("CD L1 AGENT COUNT", f"{l1a['l1']['Agent'].nunique():,}", "blue")
+with q8:
+    kpi("L1 FRESH UNASSIGNED TICKETS", f"{l1a['l1_fresh_unassigned']:,}", "orange")
+
+st.caption(
+    "Important: the raw dump contains the current Group only. Therefore "
+    "\"Currently in CD L2\" is a current-state count, not proof of historical "
+    "movement from CD L1 to CD L2. A true FCR cannot be proven because this "
+    "dump does not contain Call ID/contact history; the same-day Phone number "
+    "is shown only as an operational proxy."
+)
+
+st.markdown(
+    '<div class="section">CD L1 — AGENT-WISE WORKLOAD</div>',
+    unsafe_allow_html=True
+)
+st.dataframe(
+    l1_agent_table(filtered_all),
+    use_container_width=True,
+    hide_index=True
+)
+
+st.markdown(
+    '<div class="section">CD L1 — FRESH UNASSIGNED TICKETS <48H</div>',
+    unsafe_allow_html=True
+)
+st.dataframe(
+    l1_ticket_detail_table(filtered_all),
+    use_container_width=True,
+    hide_index=True
+)
 
 # ============================================================
 # SUMMARY
