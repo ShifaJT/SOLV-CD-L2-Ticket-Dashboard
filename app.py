@@ -350,6 +350,83 @@ def other_group_pending_table(data):
     )
 
 
+
+def other_group_agent_pending_table(data):
+    """Agent-level view of currently open/pending tickets outside CD L2."""
+    x = data[
+        ~data["_Group"].str.casefold().eq("cd l2") &
+        ~data["_ClosedLike"]
+    ].copy()
+
+    if x.empty:
+        return pd.DataFrame(columns=[
+            "Agent", "Group", "Tickets", "Open >48h",
+            "Open >90 days", "Categories", "Sub-Categories",
+            "Max Aging"
+        ])
+
+    rows = []
+    for (agent, group), g in x.groupby(
+        ["Agent", "_Group"], sort=False
+    ):
+        ages = g["_CurrentAgeHours"].dropna()
+        cats = clean_text(g["Category"]).replace("", "(blank)").unique()
+        subs = clean_text(g["Sub-Category"]).replace("", "(blank)").unique()
+
+        rows.append({
+            "Agent": agent if str(agent).strip() else "Not provided",
+            "Group": group,
+            "Tickets": unique_ticket_count(g),
+            "Open >48h": int((ages > 48).sum()),
+            "Open >90 days": int((ages > 2160).sum()),
+            "Categories": ", ".join(sorted(map(str, cats))),
+            "Sub-Categories": ", ".join(sorted(map(str, subs))),
+            "Max Aging": format_hms(ages.max()) if len(ages) else "—",
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["Open >48h", "Tickets"], ascending=False
+    ).reset_index(drop=True)
+
+
+def other_group_ticket_detail_table(data):
+    """Ticket-level details for currently open/pending tickets outside CD L2."""
+    x = data[
+        ~data["_Group"].str.casefold().eq("cd l2") &
+        ~data["_ClosedLike"]
+    ].copy()
+
+    if x.empty:
+        return pd.DataFrame(columns=[
+            "Agent", "Group", "Ticket ID", "Created Date",
+            "Last Updated Date", "Aging", "Aging Days",
+            "Category", "Sub-Category", "Open Reason"
+        ])
+
+    out = pd.DataFrame()
+    out["Agent"] = clean_text(x["Agent"]).replace("", "Not provided")
+    out["Group"] = x["_Group"]
+    out["Ticket ID"] = x["Ticket ID"]
+    out["Created Date"] = x["_Created"].dt.strftime("%d %b %Y %H:%M:%S")
+    out["Last Updated Date"] = pd.to_datetime(
+        x["Last update time"], errors="coerce"
+    ).dt.strftime("%d %b %Y %H:%M:%S")
+    out["Aging"] = x["_CurrentAgeHours"].apply(format_hms)
+    out["Aging Days"] = x["_CurrentAgeHours"].apply(
+        lambda h: "—" if pd.isna(h) else f"{h/24:.1f} days"
+    )
+    out["Category"] = clean_text(x["Category"]).replace("", "(blank)")
+    out["Sub-Category"] = clean_text(x["Sub-Category"]).replace("", "(blank)")
+    out["Open Reason"] = clean_text(x["Reason for pendency"]).replace(
+        "", "Reason not provided"
+    )
+
+    out["_AgeSort"] = x["_CurrentAgeHours"].values
+    return out.sort_values(
+        ["Group", "Agent", "_AgeSort"], ascending=[True, True, False]
+    ).drop(columns=["_AgeSort"]).reset_index(drop=True)
+
+
 def week_breakup_table(data):
     rows = []
     for wk, g in data.groupby("_WeekStart", sort=True):
@@ -467,6 +544,9 @@ def agent_summary_table(data):
 
 
 def excel_bytes(raw, cd):
+    # Excel report functions use prepared/internal columns such as _Group,
+    # _ClosedLike and _CurrentAgeHours. Prepare the full dump first.
+    full = prepare_data(raw)
     from openpyxl import load_workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -511,11 +591,17 @@ def excel_bytes(raw, cd):
         issue_breakup_table(cd, "Category").to_excel(writer,index=False,sheet_name="Category Breakup")
         issue_breakup_table(cd, "Sub-Category").to_excel(writer,index=False,sheet_name="Subcategory Breakup")
         category_subcategory_table(cd).to_excel(writer,index=False,sheet_name="Category + Subcategory")
-        other_group_pending_table(raw).to_excel(writer,index=False,sheet_name="Other Groups Pending")
+        other_group_pending_table(full).to_excel(writer,index=False,sheet_name="Other Groups Pending")
         agent_summary_table(cd).to_excel(writer,index=False,sheet_name="Agent Summary")
         agent_ticket_detail_table(cd).to_excel(writer,index=False,sheet_name="Agent Ticket Detail")
-        group_aging_table(raw).to_excel(writer,index=False,sheet_name="All Groups Aging")
-        resolution_by_group(raw).to_excel(writer,index=False,sheet_name="All Groups Resolution")
+        other_group_agent_pending_table(full).to_excel(
+            writer,index=False,sheet_name="Other Group Agent Pending"
+        )
+        other_group_ticket_detail_table(full).to_excel(
+            writer,index=False,sheet_name="Other Group Ticket Detail"
+        )
+        group_aging_table(full).to_excel(writer,index=False,sheet_name="All Groups Aging")
+        resolution_by_group(full).to_excel(writer,index=False,sheet_name="All Groups Resolution")
 
         # Monthly view for CD L2
         monthly=[]
@@ -839,6 +925,27 @@ st.caption(
 )
 agent_detail = agent_ticket_detail_table(cd)
 st.dataframe(agent_detail, use_container_width=True, hide_index=True)
+
+# ============================================================
+# OTHER GROUP — AGENT LEVEL PENDING WORKLOAD
+# ============================================================
+st.markdown(
+    '<div class="section">OTHER GROUPS — AGENT-WISE PENDING TICKETS</div>',
+    unsafe_allow_html=True
+)
+st.caption(
+    "Separate from the CD L2 KPIs. This view shows currently open/pending "
+    "tickets whose raw Group is not CD L2, grouped by agent and destination group."
+)
+other_agent_tbl = other_group_agent_pending_table(filtered_all)
+st.dataframe(other_agent_tbl, use_container_width=True, hide_index=True)
+
+st.markdown(
+    '<div class="section">OTHER GROUPS — PENDING TICKET DETAIL</div>',
+    unsafe_allow_html=True
+)
+other_detail_tbl = other_group_ticket_detail_table(filtered_all)
+st.dataframe(other_detail_tbl, use_container_width=True, hide_index=True)
 
 # ============================================================
 # TICKET AGING
