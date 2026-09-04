@@ -79,7 +79,8 @@ def format_hms(hours):
     h = total // 3600
     m = (total % 3600) // 60
     s = total % 60
-    return f"{h}:{m:02d}:{s:02d}"
+    days = float(hours) / 24
+    return f"{h}:{m:02d}:{s:02d} ({days:.1f} days)"
 
 def format_days(hours):
     if hours is None or pd.isna(hours):
@@ -373,6 +374,98 @@ def week_breakup_table(data):
     return pd.DataFrame(rows)
 
 
+
+def agent_ticket_detail_table(data):
+    """Ticket-level ownership, aging and resolution detail for the selected population."""
+    x = data.copy()
+
+    def col(name):
+        if name in x.columns:
+            return clean_text(x[name]).replace("", "Not provided")
+        return pd.Series(["Not provided"] * len(x), index=x.index)
+
+    out = pd.DataFrame(index=x.index)
+    out["Agent"] = col("Agent")
+    out["Group"] = col("Group")
+    out["Ticket ID"] = col("Ticket ID")
+
+    created = pd.to_datetime(x["_Created"], errors="coerce")
+    last_update = pd.to_datetime(x["Last update time"], errors="coerce")
+
+    out["Created Date"] = created.dt.strftime("%d %b %Y %H:%M:%S")
+    out["Last Updated Date"] = last_update.dt.strftime("%d %b %Y %H:%M:%S")
+
+    # Current age for open/pending; resolution time for closed/resolved.
+    out["Status"] = col("Status")
+    out["Category"] = col("Category")
+    out["Sub-Category"] = col("Sub-Category")
+    out["Resolution Time"] = x["_ResolutionHours"].apply(format_hms)
+
+    out["Current Aging"] = np.where(
+        x["_ClosedLike"],
+        x["_ResolutionHours"].apply(format_hms),
+        x["_CurrentAgeHours"].apply(format_hms)
+    )
+
+    out["Aging Days"] = np.where(
+        x["_ClosedLike"],
+        x["_ResolutionHours"].apply(lambda h: "—" if pd.isna(h) else f"{h/24:.1f} days"),
+        x["_CurrentAgeHours"].apply(lambda h: "—" if pd.isna(h) else f"{h/24:.1f} days")
+    )
+
+    out["48H Status"] = x["_SLA48"]
+    out["Open Reason"] = col("Reason for pendency")
+
+    # Useful first-response metric when present in the dump.
+    first_resp = x["First response time (in hrs)"].apply(parse_hms)
+    out["First Response Time"] = first_resp.apply(format_hms)
+
+    # Numeric helper for sorting/analysis.
+    out["_SortAgeHours"] = np.where(
+        x["_ClosedLike"],
+        x["_ResolutionHours"],
+        x["_CurrentAgeHours"]
+    )
+
+    return out.sort_values(
+        ["Agent", "_SortAgeHours"],
+        ascending=[True, False]
+    ).drop(columns=["_SortAgeHours"]).reset_index(drop=True)
+
+
+def agent_summary_table(data):
+    detail = agent_ticket_detail_table(data)
+    if detail.empty:
+        return pd.DataFrame(columns=[
+            "Agent", "Tickets", "Open / Pending", "Closed / Resolved",
+            "Open >48h", "Avg Resolution", "Max Resolution"
+        ])
+
+    rows = []
+    for agent, g in data.groupby(
+        clean_text(data["Agent"]).replace("", "Not provided"),
+        sort=False
+    ):
+        closed = g[g["_ClosedLike"]]
+        open_g = g[~g["_ClosedLike"]]
+        r = closed["_ResolutionHours"].dropna()
+        age = open_g["_CurrentAgeHours"].dropna()
+        rows.append({
+            "Agent": agent,
+            "Tickets": unique_ticket_count(g),
+            "Open / Pending": unique_ticket_count(open_g),
+            "Closed / Resolved": unique_ticket_count(closed),
+            "Open >48h": int((age > 48).sum()),
+            "Open >90 days": int((age > 2160).sum()),
+            "Avg Resolution": format_hms(r.mean()) if len(r) else "—",
+            "Max Resolution": format_hms(r.max()) if len(r) else "—",
+            "Max Current Age": format_hms(age.max()) if len(age) else "—",
+        })
+    return pd.DataFrame(rows).sort_values(
+        ["Open >48h", "Tickets"], ascending=False
+    ).reset_index(drop=True)
+
+
 def excel_bytes(raw, cd):
     from openpyxl import load_workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -380,9 +473,6 @@ def excel_bytes(raw, cd):
     from openpyxl.utils import get_column_letter
 
     m=metrics(cd)
-    wb=load_workbook(io.BytesIO())
-    # unreachable; create via pandas writer below
-
     buf=io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         summary=pd.DataFrame([
@@ -422,6 +512,8 @@ def excel_bytes(raw, cd):
         issue_breakup_table(cd, "Sub-Category").to_excel(writer,index=False,sheet_name="Subcategory Breakup")
         category_subcategory_table(cd).to_excel(writer,index=False,sheet_name="Category + Subcategory")
         other_group_pending_table(raw).to_excel(writer,index=False,sheet_name="Other Groups Pending")
+        agent_summary_table(cd).to_excel(writer,index=False,sheet_name="Agent Summary")
+        agent_ticket_detail_table(cd).to_excel(writer,index=False,sheet_name="Agent Ticket Detail")
         group_aging_table(raw).to_excel(writer,index=False,sheet_name="All Groups Aging")
         resolution_by_group(raw).to_excel(writer,index=False,sheet_name="All Groups Resolution")
 
@@ -521,7 +613,7 @@ try:
     if uploaded.name.lower().endswith(".csv"):
         raw=pd.read_csv(uploaded,low_memory=False)
     else:
-        raw=pd.read_excel(uploaded)
+        raw=pd.read_excel(uploaded, engine="openpyxl" if uploaded.name.lower().endswith(".xlsx") else None)
 except Exception as e:
     st.error(f"Could not read the file: {e}")
     st.stop()
@@ -728,6 +820,25 @@ st.caption(
 )
 other_tbl = other_group_pending_table(filtered_all)
 st.dataframe(other_tbl, use_container_width=True, hide_index=True)
+
+# ============================================================
+# AGENT / TICKET OWNERSHIP VIEW
+# ============================================================
+st.markdown('<div class="section">AGENT-WISE TICKET OWNERSHIP & RESOLUTION</div>',unsafe_allow_html=True)
+st.caption(
+    "Shows which agent is handling the selected CD L2 tickets, how many they "
+    "have, their open/closed workload, aging and resolution time."
+)
+agent_sum = agent_summary_table(cd)
+st.dataframe(agent_sum, use_container_width=True, hide_index=True)
+
+st.markdown('<div class="section">AGENT / TICKET-LEVEL DETAIL</div>',unsafe_allow_html=True)
+st.caption(
+    "Ticket-level view: Agent, Group, Ticket ID, Created Date, Last Updated Date, "
+    "Category, Sub-Category, resolution/aging time and 48-hour status."
+)
+agent_detail = agent_ticket_detail_table(cd)
+st.dataframe(agent_detail, use_container_width=True, hide_index=True)
 
 # ============================================================
 # TICKET AGING
