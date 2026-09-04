@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="SOLV — L2 Ticket Dashboard",
+    page_title="SOLV — L2 TAT Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -130,12 +130,53 @@ L1_GROUPS = {
     "no group",
 }
 
+# TAT mapping supplied from the user's SOLV sub-category SLA sheet.
+# Values are in calendar days. Matching is case-insensitive after trimming.
+TAT_DAYS_BY_SUBCATEGORY = {
+    "call back / rnr/call disconnected": 3,
+    "cancel order": 3,
+    "change email id": 1,
+    "change phone no.": 3,
+    "clarifications on gst/tcs certificate": 5,
+    "customer initiated off-boarding (delete account)": 2,
+    "delay in refund": 5,
+    "complaint about staff- logistics support": 5,
+    "complaint about staff- rm support": 5,
+    "gst certificate not received": 7,
+    "name screening request": 2,
+    "offer/promo/discount - not received / incorrectly received": 3,
+    "order status dispute/mismatch": 7,
+    "others- my payments": 7,
+    "others- my profile": 3,
+    "pay later - application status query": 3,
+    "pay later - product query": 3,
+    "pay later - product related dispute": 5,
+    "pick up delay": 7,
+    "request for discount coupon": 3,
+    "request for transaction/remittance ledger": 3,
+    "seller commission incorrectly charged": 7,
+    "shipment not received- past eta": 10,
+    "sme name change request": 2,
+    "solv initiated off-boarding (delete account)": 3,
+    "technical issue- app down": 3,
+}
+
 def is_l2_group(series):
     return clean_text(series).str.casefold().isin(L2_GROUPS)
 
 def is_l1_group(series):
     return clean_text(series).str.casefold().isin(L1_GROUPS)
 
+
+def normalize_subcategory(value):
+    if pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip().casefold())
+
+
+NORMALIZED_TAT_MAP = {
+    normalize_subcategory(k): v for k, v in TAT_DAYS_BY_SUBCATEGORY.items()
+}
 
 def prepare_data(raw):
     df = raw.copy()
@@ -184,11 +225,31 @@ def prepare_data(raw):
         (now - df.loc[age_mask, "_Created"]).dt.total_seconds() / 3600
     ).clip(lower=0)
 
-    # 48h SLA buckets for closed/resolved tickets.
-    df["_SLA48"] = "Open / Pending"
-    valid_closed = df["_ClosedLike"] & df["_ResolutionHours"].notna()
-    df.loc[valid_closed & (df["_ResolutionHours"] <= 48), "_SLA48"] = "Closed ≤48h"
-    df.loc[valid_closed & (df["_ResolutionHours"] > 48), "_SLA48"] = "Closed >48h"
+    # Sub-category based TAT from the user's SLA sheet, not a fixed
+    # 48-hour threshold.
+    df["_SubCategoryKey"] = clean_text(df["Sub-Category"]).apply(normalize_subcategory)
+    df["_TATDays"] = df["_SubCategoryKey"].map(NORMALIZED_TAT_MAP)
+    df["_TATHours"] = df["_TATDays"] * 24
+    df["_TATStatus"] = "TAT Not Mapped"
+
+    closed_valid_tat = (
+        df["_ClosedLike"] &
+        df["_ResolutionHours"].notna() &
+        df["_TATHours"].notna()
+    )
+    df.loc[closed_valid_tat & (df["_ResolutionHours"] <= df["_TATHours"]), "_TATStatus"] = "Closed Within TAT"
+    df.loc[closed_valid_tat & (df["_ResolutionHours"] > df["_TATHours"]), "_TATStatus"] = "Closed Beyond TAT"
+
+    open_valid_tat = (
+        open_like &
+        df["_CurrentAgeHours"].notna() &
+        df["_TATHours"].notna()
+    )
+    df.loc[open_valid_tat & (df["_CurrentAgeHours"] <= df["_TATHours"]), "_TATStatus"] = "Open Within TAT"
+    df.loc[open_valid_tat & (df["_CurrentAgeHours"] > df["_TATHours"]), "_TATStatus"] = "Open Beyond TAT"
+
+    # Backward-compatible label for downloads; dashboard logic now uses TAT.
+    df["_SLA48"] = df["_TATStatus"]
 
     # Aging buckets for current open/pending workload.
     df["_AgingBucket"] = "Closed / Resolved"
@@ -397,30 +458,40 @@ def metrics(data):
     closed_valid = data[data["_ClosedLike"] & data["_ResolutionHours"].notna()]
     res = closed_valid["_ResolutionHours"]
 
-    closed_48 = unique_ticket_count(
-        data[data["_ClosedLike"] & (data["_ResolutionHours"] <= 48)]
+    closed_within_tat = unique_ticket_count(
+        data[data["_TATStatus"].eq("Closed Within TAT")]
     )
-    closed_gt48 = unique_ticket_count(
-        data[data["_ClosedLike"] & (data["_ResolutionHours"] > 48)]
+    closed_beyond_tat = unique_ticket_count(
+        data[data["_TATStatus"].eq("Closed Beyond TAT")]
     )
 
+    open_beyond_tat = unique_ticket_count(
+        data[data["_TATStatus"].eq("Open Beyond TAT")]
+    )
+    tat_mapped = int(data["_TATHours"].notna().sum())
+    tat_unmapped = int(data["_TATHours"].isna().sum())
+
     open_age = data.loc[~data["_ClosedLike"], "_CurrentAgeHours"].dropna()
-    open_gt48 = int((open_age > 48).sum())
     open_gt90 = int((open_age > 2160).sum())
+
+    tat_closed_eligible = closed_within_tat + closed_beyond_tat
 
     return {
         "raised": raised,
         "closed": closed,
         "open": open_n,
-        "closed48": closed_48,
-        "closedgt48": closed_gt48,
-        "closure48pct": safe_pct(closed_48, raised),
+        "closed_within_tat": closed_within_tat,
+        "closed_beyond_tat": closed_beyond_tat,
+        "tat_compliance_pct": safe_pct(closed_within_tat, tat_closed_eligible),
+        "tat_closed_eligible": tat_closed_eligible,
+        "open_beyond_tat": open_beyond_tat,
+        "tat_mapped": tat_mapped,
+        "tat_unmapped": tat_unmapped,
         "avg": res.mean() if len(res) else np.nan,
         "max_resolution": res.max() if len(res) else np.nan,
         "p90": res.quantile(0.90) if len(res) else np.nan,
         "p95": res.quantile(0.95) if len(res) else np.nan,
         "p99": res.quantile(0.99) if len(res) else np.nan,
-        "open_gt48": open_gt48,
         "open_gt90": open_gt90,
         "max_open_age": open_age.max() if len(open_age) else np.nan,
         "valid_resolution": len(res),
@@ -434,11 +505,41 @@ def group_aging_table(data):
             "Group": group,
             "Tickets": unique_ticket_count(g),
             "Open/Pending": unique_ticket_count(g[~g["_ClosedLike"]]),
-            "Open >48h": int((age > 48).sum()),
+            "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
             "Open >90 days": int((age > 2160).sum()),
             "Max Open Age": format_hms(age.max()) if len(age) else "—",
         })
     return pd.DataFrame(rows).sort_values("Tickets", ascending=False).reset_index(drop=True)
+
+def subcategory_tat_performance_table(data):
+    """Sub-category level TAT performance with the mapped TAT shown explicitly."""
+    x = data.copy()
+    x["_SubcatDisplay"] = clean_text(x["Sub-Category"]).replace("", "(blank)")
+    rows=[]
+    for sub,g in x.groupby("_SubcatDisplay", sort=False):
+        raised = unique_ticket_count(g)
+        closed = g[g["_ClosedLike"]]
+        eligible_closed = closed[closed["_TATStatus"].isin(["Closed Within TAT","Closed Beyond TAT"])]
+        within = unique_ticket_count(eligible_closed[eligible_closed["_TATStatus"].eq("Closed Within TAT")])
+        beyond = unique_ticket_count(eligible_closed[eligible_closed["_TATStatus"].eq("Closed Beyond TAT")])
+        open_beyond = unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")])
+        tat_vals = g["_TATDays"].dropna().unique()
+        tat_label = f"{int(tat_vals[0])} days" if len(tat_vals) else "Not mapped"
+        rows.append({
+            "Sub-Category": sub,
+            "TAT": tat_label,
+            "Tickets Raised": raised,
+            "Closed / Resolved": unique_ticket_count(closed),
+            "Closed Within TAT": within,
+            "Closed Beyond TAT": beyond,
+            "TAT Compliance %": round(safe_pct(within, within + beyond), 1) if (within + beyond) else np.nan,
+            "Open / Pending": unique_ticket_count(g[~g["_ClosedLike"]]),
+            "Open Beyond TAT": open_beyond,
+        })
+    return pd.DataFrame(rows).sort_values("Tickets Raised", ascending=False).reset_index(drop=True) if rows else pd.DataFrame(columns=[
+        "Sub-Category","TAT","Tickets Raised","Closed / Resolved","Closed Within TAT","Closed Beyond TAT","TAT Compliance %","Open / Pending","Open Beyond TAT"
+    ])
+
 
 def open_reason_table(data):
     x = data[~data["_ClosedLike"]].copy()
@@ -473,8 +574,15 @@ def resolution_by_group(data):
         rows.append({
             "Group":group,
             "Closed/Resolved":unique_ticket_count(g[g["_ClosedLike"]]),
-            "Closed ≤48h":int((r<=48).sum()),
-            "Closed >48h":int((r>48).sum()),
+            "Closed Within TAT":unique_ticket_count(g[g["_TATStatus"].eq("Closed Within TAT")]),
+            "Closed Beyond TAT":unique_ticket_count(g[g["_TATStatus"].eq("Closed Beyond TAT")]),
+            "TAT Compliance %":round(
+                safe_pct(
+                    unique_ticket_count(g[g["_TATStatus"].eq("Closed Within TAT")]),
+                    unique_ticket_count(g[g["_TATStatus"].isin(["Closed Within TAT","Closed Beyond TAT"])])
+                ),1
+            ),
+            "Open Beyond TAT":unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
             "Avg Resolution":format_hms(r.mean()) if len(r) else "—",
             "Max Resolution":format_hms(r.max()) if len(r) else "—",
         })
@@ -531,7 +639,7 @@ def other_group_pending_table(data):
     if x.empty:
         return pd.DataFrame(columns=[
             "Current Group", "Tickets", "Open / Pending",
-            "Open >48h", "Open >90 days", "Max Open Age"
+            "Open Beyond TAT", "Open >90 days", "Max Open Age"
         ])
 
     rows = []
@@ -542,7 +650,7 @@ def other_group_pending_table(data):
             "Current Group": group,
             "Tickets": unique_ticket_count(g),
             "Open / Pending": unique_ticket_count(open_g),
-            "Open >48h": int((ages > 48).sum()),
+            "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
             "Open >90 days": int((ages > 2160).sum()),
             "Max Open Age": format_hms(ages.max()) if len(ages) else "—",
         })
@@ -555,6 +663,76 @@ def other_group_pending_table(data):
 
 
 
+def other_group_open_breakup_table(data):
+    """Open/pending tickets outside L2, broken down by current group and status."""
+    x = data[~data["_IsL2"] & ~data["_ClosedLike"]].copy()
+    cols = ["Current Group", "Open", "Pending", "Open / Pending", "Open Beyond TAT", "Agents"]
+    if x.empty:
+        return pd.DataFrame(columns=cols)
+
+    x["_StatusLabel"] = x["_Status"].where(
+        x["_Status"].isin(["OPEN", "PENDING"]), x["_Status"]
+    )
+    rows=[]
+    for group,g in x.groupby("_Group", sort=False):
+        agents = clean_text(g["Agent"]).replace("", "Not provided").unique().tolist()
+        rows.append({
+            "Current Group": group,
+            "Open": unique_ticket_count(g[g["_Status"].eq("OPEN")]),
+            "Pending": unique_ticket_count(g[g["_Status"].eq("PENDING")]),
+            "Open / Pending": unique_ticket_count(g),
+            "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
+            "Agents": ", ".join(sorted(map(str, agents))),
+        })
+    return pd.DataFrame(rows, columns=cols).sort_values(
+        ["Open / Pending", "Open Beyond TAT"], ascending=False
+    ).reset_index(drop=True)
+
+
+def other_group_open_agent_breakup_table(data):
+    x = data[~data["_IsL2"] & ~data["_ClosedLike"]].copy()
+    cols=["Current Group","Agent","Open","Pending","Open / Pending","Open Beyond TAT","Max Aging"]
+    if x.empty:
+        return pd.DataFrame(columns=cols)
+    rows=[]
+    for (group,agent),g in x.groupby(["_Group","Agent"], sort=False):
+        agent_name = str(agent).strip() if str(agent).strip() else "Not provided"
+        age=g["_CurrentAgeHours"].dropna()
+        rows.append({
+            "Current Group":group,
+            "Agent":agent_name,
+            "Open":unique_ticket_count(g[g["_Status"].eq("OPEN")]),
+            "Pending":unique_ticket_count(g[g["_Status"].eq("PENDING")]),
+            "Open / Pending":unique_ticket_count(g),
+            "Open Beyond TAT":unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
+            "Max Aging":format_hms(age.max()) if len(age) else "—",
+        })
+    return pd.DataFrame(rows, columns=cols).sort_values(
+        ["Open / Pending","Open Beyond TAT"], ascending=False
+    ).reset_index(drop=True)
+
+
+def other_group_open_category_breakup_table(data):
+    x = data[~data["_IsL2"] & ~data["_ClosedLike"]].copy()
+    cols=["Current Group","Category","Sub-Category","Open / Pending","Open Beyond TAT"]
+    if x.empty:
+        return pd.DataFrame(columns=cols)
+    x["Category"] = clean_text(x["Category"]).replace("","(blank)")
+    x["Sub-Category"] = clean_text(x["Sub-Category"]).replace("","(blank)")
+    rows=[]
+    for (group,cat,sub),g in x.groupby(["_Group","Category","Sub-Category"], sort=False):
+        rows.append({
+            "Current Group":group,
+            "Category":cat,
+            "Sub-Category":sub,
+            "Open / Pending":unique_ticket_count(g),
+            "Open Beyond TAT":unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
+        })
+    return pd.DataFrame(rows, columns=cols).sort_values(
+        ["Open / Pending","Open Beyond TAT"], ascending=False
+    ).reset_index(drop=True)
+
+
 def other_group_agent_pending_table(data):
     """Agent-level view of currently open/pending tickets outside L2."""
     x = data[
@@ -564,7 +742,7 @@ def other_group_agent_pending_table(data):
 
     if x.empty:
         return pd.DataFrame(columns=[
-            "Agent", "Group", "Tickets", "Open >48h",
+            "Agent", "Group", "Tickets", "Open Beyond TAT",
             "Open >90 days", "Categories", "Sub-Categories",
             "Max Aging"
         ])
@@ -581,7 +759,7 @@ def other_group_agent_pending_table(data):
             "Agent": agent if str(agent).strip() else "Not provided",
             "Group": group,
             "Tickets": unique_ticket_count(g),
-            "Open >48h": int((ages > 48).sum()),
+            "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
             "Open >90 days": int((ages > 2160).sum()),
             "Categories": ", ".join(sorted(map(str, cats))),
             "Sub-Categories": ", ".join(sorted(map(str, subs))),
@@ -589,7 +767,7 @@ def other_group_agent_pending_table(data):
         })
 
     return pd.DataFrame(rows).sort_values(
-        ["Open >48h", "Tickets"], ascending=False
+        ["Open Beyond TAT", "Tickets"], ascending=False
     ).reset_index(drop=True)
 
 
@@ -645,11 +823,11 @@ def week_breakup_table(data):
             "Tickets Raised": mm["raised"],
             "Closed / Resolved": mm["closed"],
             "Open / Pending": mm["open"],
-            "Closed ≤48h": mm["closed48"],
-            "Closed >48h": mm["closedgt48"],
-            "48H Closure %": round(mm["closure48pct"], 1),
+            "Closed Within TAT": mm["closed_within_tat"],
+            "Closed Beyond TAT": mm["closed_beyond_tat"],
+            "TAT Compliance %": round(mm["tat_compliance_pct"], 1),
             "Avg Resolution": format_hms(mm["avg"]),
-            "Open >48h": mm["open_gt48"],
+            "Open Beyond TAT": mm["open_beyond_tat"],
             "Open >90 days": mm["open_gt90"],
         })
     return pd.DataFrame(rows)
@@ -694,7 +872,10 @@ def agent_ticket_detail_table(data):
         x["_CurrentAgeHours"].apply(lambda h: "—" if pd.isna(h) else f"{h/24:.1f} days")
     )
 
-    out["48H Status"] = x["_SLA48"]
+    out["TAT Days"] = x["_TATDays"].apply(
+        lambda d: "—" if pd.isna(d) else f"{int(d)} days"
+    )
+    out["TAT Status"] = x["_TATStatus"]
     out["Open Reason"] = col("Reason for pendency")
 
     # Useful first-response metric when present in the dump.
@@ -719,7 +900,7 @@ def agent_summary_table(data):
     if detail.empty:
         return pd.DataFrame(columns=[
             "Agent", "Tickets", "Open / Pending", "Closed / Resolved",
-            "Open >48h", "Avg Resolution", "Max Resolution"
+            "Open Beyond TAT", "Avg Resolution", "Max Resolution"
         ])
 
     rows = []
@@ -736,14 +917,14 @@ def agent_summary_table(data):
             "Tickets": unique_ticket_count(g),
             "Open / Pending": unique_ticket_count(open_g),
             "Closed / Resolved": unique_ticket_count(closed),
-            "Open >48h": int((age > 48).sum()),
+            "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
             "Open >90 days": int((age > 2160).sum()),
             "Avg Resolution": format_hms(r.mean()) if len(r) else "—",
             "Max Resolution": format_hms(r.max()) if len(r) else "—",
             "Max Current Age": format_hms(age.max()) if len(age) else "—",
         })
     return pd.DataFrame(rows).sort_values(
-        ["Open >48h", "Tickets"], ascending=False
+        ["Open Beyond TAT", "Tickets"], ascending=False
     ).reset_index(drop=True)
 
 
@@ -767,7 +948,7 @@ def agent_cross_group_summary(data, agent):
     if x.empty:
         return pd.DataFrame(columns=[
             "Group", "Tickets", "Open / Pending", "Closed / Resolved",
-            "Open >48h", "Open >90 days", "Avg Resolution",
+            "Open Beyond TAT", "Open >90 days", "Avg Resolution",
             "Max Open Aging"
         ])
 
@@ -783,14 +964,14 @@ def agent_cross_group_summary(data, agent):
             "Tickets": unique_ticket_count(g),
             "Open / Pending": unique_ticket_count(open_g),
             "Closed / Resolved": unique_ticket_count(closed_g),
-            "Open >48h": int((age > 48).sum()),
+            "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
             "Open >90 days": int((age > 2160).sum()),
             "Avg Resolution": format_hms(res.mean()) if len(res) else "—",
             "Max Open Aging": format_hms(age.max()) if len(age) else "—",
         })
 
     return pd.DataFrame(rows).sort_values(
-        ["Open >48h", "Tickets"],
+        ["Open Beyond TAT", "Tickets"],
         ascending=False
     ).reset_index(drop=True)
 
@@ -807,7 +988,7 @@ def agent_cross_group_tickets(data, agent, selected_group=None):
             "Group", "Ticket ID", "Status", "Created Date",
             "Last Updated Date", "Category", "Sub-Category",
             "Resolution Time", "Current Aging", "Aging Days",
-            "48H SLA", "Open Reason"
+            "TAT Status", "Open Reason"
         ])
 
     out = pd.DataFrame()
@@ -838,7 +1019,10 @@ def agent_cross_group_tickets(data, agent, selected_group=None):
         )
     )
 
-    out["48H SLA"] = x["_SLA48"]
+    out["TAT Days"] = x["_TATDays"].apply(
+        lambda d: "—" if pd.isna(d) else f"{int(d)} days"
+    )
+    out["TAT Status"] = x["_TATStatus"]
     out["Open Reason"] = clean_text(
         x["Reason for pendency"]
     ).replace("", "Reason not provided")
@@ -957,10 +1141,13 @@ def excel_bytes(raw, l2):
             ["Tickets Raised",m["raised"]],
             ["Closed / Resolved",m["closed"]],
             ["Open / Pending",m["open"]],
-            ["Closed ≤48h",m["closed48"]],
-            ["Closed >48h",m["closedgt48"]],
-            ["48H Closure %",round(m["closure48pct"],1)],
-            ["Open / Pending >48h",m["open_gt48"]],
+            ["Closed Within TAT",m["closed_within_tat"]],
+            ["Closed Beyond TAT",m["closed_beyond_tat"]],
+            ["TAT Eligible Closed / Resolved",m["tat_closed_eligible"]],
+            ["TAT Compliance %",round(m["tat_compliance_pct"],1)],
+            ["Open / Pending Beyond TAT",m["open_beyond_tat"]],
+            ["TAT Mapped Tickets",m["tat_mapped"]],
+            ["TAT Unmapped Tickets",m["tat_unmapped"]],
             ["Open / Pending >90 days",m["open_gt90"]],
             ["Average Resolution",format_hms(m["avg"])],
             ["Max Resolution",format_hms(m["max_resolution"])],
@@ -972,16 +1159,17 @@ def excel_bytes(raw, l2):
         summary.to_excel(writer,index=False,sheet_name="Summary")
 
         cd_out=l2[[
-            "Ticket ID","Subject","Status","Priority","Type","Agent","Group",
+            "Ticket ID","Subject","Status","Priority","Type","Agent","Group","CreatedBy",
             "Created time","Closed time","Last update time",
             "Resolution time (in hrs)","Resolution status",
             "Reason for pendency","Category","Sub-Category",
-            "_CurrentAgeHours","_AgingBucket","_SLA48"
+            "_CurrentAgeHours","_AgingBucket","_TATDays","_TATStatus"
         ]].copy()
         cd_out.rename(columns={
             "_CurrentAgeHours":"Current Age Hours",
             "_AgingBucket":"Current Aging Bucket",
-            "_SLA48":"48H SLA Bucket"
+            "_TATDays":"TAT Days",
+            "_TATStatus":"TAT Status"
         },inplace=True)
         cd_out.to_excel(writer,index=False,sheet_name="L2 Raw + Analysis")
 
@@ -989,8 +1177,12 @@ def excel_bytes(raw, l2):
         open_reason_table(l2).to_excel(writer,index=False,sheet_name="Open Reasons")
         issue_breakup_table(l2, "Category").to_excel(writer,index=False,sheet_name="Category Breakup")
         issue_breakup_table(l2, "Sub-Category").to_excel(writer,index=False,sheet_name="Subcategory Breakup")
+        subcategory_tat_performance_table(l2).to_excel(writer,index=False,sheet_name="Subcategory TAT Performance")
         category_subcategory_table(l2).to_excel(writer,index=False,sheet_name="Category + Subcategory")
         other_group_pending_table(full).to_excel(writer,index=False,sheet_name="Other Groups Pending")
+        other_group_open_breakup_table(full).to_excel(writer,index=False,sheet_name="Other Open Breakup")
+        other_group_open_agent_breakup_table(full).to_excel(writer,index=False,sheet_name="Other Open Agent Breakup")
+        other_group_open_category_breakup_table(full).to_excel(writer,index=False,sheet_name="Other Open Category")
         agent_summary_table(l2).to_excel(writer,index=False,sheet_name="Agent Summary")
         agent_ticket_detail_table(l2).to_excel(writer,index=False,sheet_name="Agent Ticket Detail")
         l1_agent_table(full).to_excel(writer,index=False,sheet_name="CD L1 Agent Summary")
@@ -1015,9 +1207,9 @@ def excel_bytes(raw, l2):
                 "Tickets Raised":mm["raised"],
                 "Closed/Resolved":mm["closed"],
                 "Open/Pending":mm["open"],
-                "Closed ≤48h":mm["closed48"],
-                "Closed >48h":mm["closedgt48"],
-                "48H Closure %":round(mm["closure48pct"],1),
+                "Closed Within TAT":mm["closed_within_tat"],
+                "Closed Beyond TAT":mm["closed_beyond_tat"],
+                "TAT Compliance %":round(mm["tat_compliance_pct"],1),
                 "Avg Resolution":format_hms(mm["avg"]),
                 "90%":format_hms(mm["p90"]),
                 "95%":format_hms(mm["p95"]),
@@ -1062,9 +1254,9 @@ def excel_bytes(raw, l2):
         for row in ws.iter_rows():
             for cell in row:
                 if isinstance(cell.value,str):
-                    if ">48h" in cell.value or ">90" in cell.value:
+                    if "Beyond TAT" in cell.value or ">90" in cell.value:
                         cell.fill=red
-                    if "≤48h" in cell.value:
+                    if "Within TAT" in cell.value:
                         cell.fill=green
     out=io.BytesIO()
     wb.save(out)
@@ -1075,8 +1267,8 @@ def excel_bytes(raw, l2):
 # ============================================================
 st.markdown("""
 <div class="hero">
-  <h1>SOLV — L2 TICKET PERFORMANCE DASHBOARD</h1>
-  <p>L2 bucket health, 48-hour SLA, ticket aging, resolution performance and workload drivers.</p>
+  <h1>SOLV — L2 TICKET PERFORMANCE & TAT DASHBOARD</h1>
+  <p>L2 bucket health, sub-category TAT, ticket aging, resolution performance and workload drivers.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1476,13 +1668,35 @@ r1=st.columns(4)
 with r1[0]: kpi("TICKETS IN L2",f"{m['raised']:,}","blue","Total tickets raised in the configured L2 groups")
 with r1[1]: kpi("CLOSED / RESOLVED",f"{m['closed']:,}","green","Closed or resolved tickets")
 with r1[2]: kpi("OPEN / PENDING",f"{m['open']:,}","red","Current unresolved workload")
-with r1[3]: kpi("OPEN / PENDING >48H",f"{m['open_gt48']:,}","orange","Current tickets older than 48h")
+with r1[3]: kpi("TAT MAPPED / UNMAPPED",f"{m['tat_mapped']:,} / {m['tat_unmapped']:,}","dark","Tickets with / without a Sub-category TAT mapping")
 
 r2=st.columns(4)
-with r2[0]: kpi("CLOSED ≤48H",f"{m['closed48']:,}","green","Resolved within 48 hours")
-with r2[1]: kpi("CLOSED >48H",f"{m['closedgt48']:,}","orange","Resolved after 48 hours")
-with r2[2]: kpi("48H CLOSURE %",f"{m['closure48pct']:.1f}%","blue","Closed ≤48h ÷ total tickets raised")
-with r2[3]: kpi("OPEN / PENDING >90 DAYS",f"{m['open_gt90']:,}","red","Current age from Created time")
+with r2[0]: kpi("CLOSED WITHIN TAT",f"{m['closed_within_tat']:,}","green","Closed within the mapped Sub-category TAT")
+with r2[1]: kpi("CLOSED BEYOND TAT",f"{m['closed_beyond_tat']:,}","orange","Closed after the mapped Sub-category TAT")
+with r2[2]: kpi("TAT COMPLIANCE %",f"{m['tat_compliance_pct']:.1f}%","blue","Closed within TAT ÷ total tickets raised")
+with r2[3]: kpi("OPEN / PENDING BEYOND TAT",f"{m['open_beyond_tat']:,}","red","Current age is beyond the mapped Sub-category TAT")
+
+with st.popover("🔎 VIEW OPEN / PENDING BREAKUP IN OTHER GROUPS"):
+    st.markdown("### Other Groups — Open / Pending Breakup")
+    st.caption("Current Group is outside the configured L2 bucket. This is a current-state view after the selected Month / Week / Day / Status / Category filters.")
+    other_open_all = filtered_all[~filtered_all["_IsL2"] & ~filtered_all["_ClosedLike"]].copy()
+    og_total = unique_ticket_count(other_open_all)
+    og_open = unique_ticket_count(other_open_all[other_open_all["_Status"].eq("OPEN")])
+    og_pending = unique_ticket_count(other_open_all[other_open_all["_Status"].eq("PENDING")])
+    og_pending_brand = unique_ticket_count(other_open_all[other_open_all["_Status"].eq("PENDING FROM BRAND")])
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: kpi("OTHER GROUP UNRESOLVED", f"{og_total:,}", "red", "Open + Pending + other unresolved statuses")
+    with c2: kpi("OTHER GROUP OPEN", f"{og_open:,}", "orange")
+    with c3: kpi("OTHER GROUP PENDING", f"{og_pending:,}", "blue")
+    with c4: kpi("PENDING FROM BRAND", f"{og_pending_brand:,}", "orange")
+    st.markdown("**By Current Group**")
+    st.dataframe(other_group_open_breakup_table(filtered_all), use_container_width=True, hide_index=True)
+    st.markdown("**By Group + Agent**")
+    st.dataframe(other_group_open_agent_breakup_table(filtered_all), use_container_width=True, hide_index=True)
+    st.markdown("**By Group + Category + Sub-Category**")
+    st.dataframe(other_group_open_category_breakup_table(filtered_all), use_container_width=True, hide_index=True)
+    st.markdown("**Ticket-level detail**")
+    st.dataframe(other_group_ticket_detail_table(filtered_all), use_container_width=True, hide_index=True)
 
 r3=st.columns(4)
 with r3[0]: kpi("AVG RESOLUTION",format_hms(m["avg"]),"blue","Valid closed/resolved tickets")
@@ -1491,8 +1705,8 @@ with r3[2]: kpi("MAX CURRENT AGE",format_hms(m["max_open_age"]),"red","Oldest op
 with r3[3]: kpi("VALID RESOLUTION TICKETS",f"{m['valid_resolution']:,}","dark","Used for average and percentiles")
 
 st.caption(
-    "48H Closure % is calculated against total L2 tickets raised in the selected population. "
-    "Resolution-time metrics use valid closed/resolved tickets and the raw 'Resolution time (in hrs)' field."
+    "TAT compliance is calculated on closed/resolved tickets with a mapped Sub-category TAT. "
+    "TAT is mapped from the Sub-Category SLA sheet; tickets without a mapping are shown separately. Resolution-time metrics use valid closed/resolved tickets and the raw 'Resolution time (in hrs)' field."
 )
 
 # ============================================================
@@ -1507,6 +1721,24 @@ with p3: kpi("99% PERCENTILE RESOLUTION HRS",format_hms(m["p99"]),"red","PERCENT
 st.caption(
     "Percentiles are calculated from valid closed/resolved resolution times. "
     "They indicate the resolution-time point below which 90%, 95% or 99% of the valid tickets fall."
+)
+
+# ============================================================
+# TAT MAPPING
+# ============================================================
+st.markdown('<div class="section">SUB-CATEGORY TAT MAPPING</div>',unsafe_allow_html=True)
+tat_map_df = pd.DataFrame(
+    [(k.title(), v) for k,v in TAT_DAYS_BY_SUBCATEGORY.items()],
+    columns=["Sub-Category", "TAT (Days)"]
+).sort_values("Sub-Category").reset_index(drop=True)
+st.dataframe(tat_map_df,use_container_width=True,hide_index=True)
+st.caption(f"TAT mapped for {m['tat_mapped']:,} of {m['raised']:,} L2 tickets in the selected population; {m['tat_unmapped']:,} ticket(s) have a Sub-category without a mapping.")
+
+st.markdown('<div class="section">SUB-CATEGORY-WISE TAT PERFORMANCE</div>',unsafe_allow_html=True)
+st.dataframe(
+    subcategory_tat_performance_table(l2),
+    use_container_width=True,
+    hide_index=True
 )
 
 # ============================================================
@@ -1557,7 +1789,7 @@ st.dataframe(agent_sum, use_container_width=True, hide_index=True)
 st.markdown('<div class="section">AGENT / TICKET-LEVEL DETAIL</div>',unsafe_allow_html=True)
 st.caption(
     "Ticket-level view: Agent, Group, Ticket ID, Created Date, Last Updated Date, "
-    "Category, Sub-Category, resolution/aging time and 48-hour status."
+    "Category, Sub-Category, resolution/aging time and Sub-category TAT status."
 )
 agent_detail = agent_ticket_detail_table(l2)
 st.dataframe(agent_detail, use_container_width=True, hide_index=True)
@@ -1626,9 +1858,9 @@ for key,g in l2.groupby("_MonthSort",sort=True):
         "Raised":mm["raised"],
         "Closed / Resolved":mm["closed"],
         "Open / Pending":mm["open"],
-        "Closed ≤48h":mm["closed48"],
-        "Closed >48h":mm["closedgt48"],
-        "48H Closure %":round(mm["closure48pct"],1),
+        "Closed Within TAT":mm["closed_within_tat"],
+        "Closed Beyond TAT":mm["closed_beyond_tat"],
+        "TAT Compliance %":round(mm["tat_compliance_pct"],1),
         "Avg Resolution":format_hms(mm["avg"]),
         "90%":format_hms(mm["p90"]),
         "95%":format_hms(mm["p95"]),
@@ -1643,8 +1875,8 @@ st.dataframe(monthly_df,use_container_width=True,hide_index=True)
 st.markdown('<div class="section">DOWNLOAD REPORT</div>',unsafe_allow_html=True)
 st.caption(
     "The Excel report contains L2 raw data with analysis columns, "
-    "category/sub-category breakups, open reasons, ticket aging, other-group "
-    "pending tickets, group aging, group resolution, weekly and monthly trends. "
+    "category/sub-category breakups, sub-category TAT mapping/performance, TAT status, open reasons, ticket aging, other-group "
+    "pending tickets, other-group open breakup, group aging, group resolution, weekly and monthly trends. "
     "Every main table has Excel filters enabled."
 )
 
