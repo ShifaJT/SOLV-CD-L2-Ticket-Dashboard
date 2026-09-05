@@ -130,36 +130,176 @@ L1_GROUPS = {
     "no group",
 }
 
-# TAT mapping supplied from the user's SOLV sub-category SLA sheet.
-# Values are in calendar days. Matching is case-insensitive after trimming.
-TAT_DAYS_BY_SUBCATEGORY = {
-    "call back / rnr/call disconnected": 3,
-    "cancel order": 3,
-    "change email id": 1,
-    "change phone no.": 3,
-    "clarifications on gst/tcs certificate": 5,
-    "customer initiated off-boarding (delete account)": 2,
-    "delay in refund": 5,
-    "complaint about staff- logistics support": 5,
-    "complaint about staff- rm support": 5,
-    "gst certificate not received": 7,
-    "name screening request": 2,
-    "offer/promo/discount - not received / incorrectly received": 3,
-    "order status dispute/mismatch": 7,
-    "others- my payments": 7,
-    "others- my profile": 3,
-    "pay later - application status query": 3,
-    "pay later - product query": 3,
-    "pay later - product related dispute": 5,
-    "pick up delay": 7,
-    "request for discount coupon": 3,
-    "request for transaction/remittance ledger": 3,
-    "seller commission incorrectly charged": 7,
-    "shipment not received- past eta": 10,
-    "sme name change request": 2,
-    "solv initiated off-boarding (delete account)": 3,
-    "technical issue- app down": 3,
-}
+# ============================================================
+# LIVE TAT SOURCE — GOOGLE SHEET
+# ============================================================
+# The dashboard reads the current TAT sheet at runtime.
+# Google Sheet from the user's screenshot:
+# Spreadsheet ID: 1WONn8c8JQjmVYYYpt06jA-DUzH7YkroE4IxHoMO-TqM
+# Sheet/tab: gid=0
+#
+# Expected columns:
+#   Subcategory
+#   SLA effective Jun'25
+#
+# If the sheet is private, add GOOGLE_SERVICE_ACCOUNT_JSON to
+# Streamlit Secrets. If it is publicly readable, the CSV export
+# works without credentials.
+
+GOOGLE_TAT_SHEET_ID = "1WONn8c8JQjmVYYYpt06jA-DUzH7YkroE4IxHoMO-TqM"
+GOOGLE_TAT_GID = "0"
+
+def normalize_subcategory(value):
+    if pd.isna(value):
+        return ""
+    s = str(value).strip().casefold()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[-–—_/]+", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def _read_tat_public_csv():
+    import requests
+    url = (
+        f"https://docs.google.com/spreadsheets/d/"
+        f"{GOOGLE_TAT_SHEET_ID}/export?format=csv&gid={GOOGLE_TAT_GID}"
+    )
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    if not r.text.strip():
+        raise ValueError("The Google TAT sheet returned an empty response.")
+    return pd.read_csv(io.StringIO(r.text))
+
+def _read_tat_from_service_account():
+    # Optional private-sheet support through Streamlit Secrets.
+    import json
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    secret = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not secret:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not configured.")
+
+    if isinstance(secret, str):
+        info = json.loads(secret)
+    else:
+        info = dict(secret)
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(GOOGLE_TAT_SHEET_ID)
+    ws = sh.get_worksheet_by_id(int(GOOGLE_TAT_GID))
+    return pd.DataFrame(ws.get_all_records())
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_live_tat_sheet():
+    errors = []
+
+    # First try the public CSV export.
+    try:
+        raw_tat = _read_tat_public_csv()
+    except Exception as e:
+        errors.append(f"Public Google Sheet CSV export: {e}")
+        raw_tat = None
+
+    # If public export fails, try a service account configured in Secrets.
+    if raw_tat is None:
+        try:
+            raw_tat = _read_tat_from_service_account()
+        except Exception as e:
+            errors.append(f"Service-account access: {e}")
+
+    if raw_tat is None:
+        raise RuntimeError(
+            "Could not read the live TAT Google Sheet. "
+            "Make the sheet accessible to the Streamlit app or configure "
+            "GOOGLE_SERVICE_ACCOUNT_JSON in Streamlit Secrets. "
+            + " | ".join(errors)
+        )
+
+    # Clean column names.
+    raw_tat.columns = [str(c).strip() for c in raw_tat.columns]
+
+    sub_col = next(
+        (c for c in raw_tat.columns if normalize_subcategory(c) == "subcategory"),
+        None
+    )
+    sla_col = next(
+        (
+            c for c in raw_tat.columns
+            if normalize_subcategory(c) in {
+                "sla effective jun25",
+                "sla effective jun 25",
+                "sla effective jun 2025",
+            }
+        ),
+        None
+    )
+
+    if sub_col is None or sla_col is None:
+        raise ValueError(
+            "TAT sheet must contain 'Subcategory' and "
+            "'SLA effective Jun'25' columns. "
+            f"Found columns: {list(raw_tat.columns)}"
+        )
+
+    tat = raw_tat[[sub_col, sla_col]].copy()
+    tat.columns = ["Subcategory", "TAT Raw"]
+
+    tat["Subcategory"] = clean_text(tat["Subcategory"])
+    tat["TAT Numeric"] = pd.to_numeric(
+        tat["TAT Raw"].astype(str).str.strip().replace(
+            {"NA": np.nan, "N/A": np.nan, "na": np.nan, "n/a": np.nan, "": np.nan}
+        ),
+        errors="coerce"
+    )
+    tat["_Key"] = tat["Subcategory"].apply(normalize_subcategory)
+
+    # Ignore blank rows. If duplicate sub-categories exist, keep the last
+    # populated numeric TAT and expose the duplicate count to the UI.
+    tat = tat[tat["_Key"].ne("")].copy()
+
+    duplicate_keys = (
+        tat[tat["_Key"].duplicated(keep=False)]["_Key"]
+        .value_counts()
+    )
+    duplicate_count = int((duplicate_keys > 1).sum())
+
+    populated = tat[tat["TAT Numeric"].notna()].copy()
+    tat_map = (
+        populated.drop_duplicates("_Key", keep="last")
+        .set_index("_Key")["TAT Numeric"]
+        .to_dict()
+    )
+
+    # Keep the full mapping table exactly as represented in the source,
+    # including NA TAT rows.
+    display = tat[["Subcategory", "TAT Raw"]].copy()
+    display["TAT (Days)"] = tat["TAT Numeric"].apply(
+        lambda x: f"{int(x)} days" if pd.notna(x) else "NA"
+    )
+
+    return {
+        "map": tat_map,
+        "table": display,
+        "rows": len(display),
+        "mapped_rows": int(populated["_Key"].nunique()),
+        "duplicate_subcategories": duplicate_count,
+        "source_url": (
+            f"https://docs.google.com/spreadsheets/d/"
+            f"{GOOGLE_TAT_SHEET_ID}/edit?gid={GOOGLE_TAT_GID}"
+        ),
+    }
+
+def get_tat_data():
+    try:
+        return load_live_tat_sheet(), None
+    except Exception as e:
+        return None, str(e)
 
 def is_l2_group(series):
     return clean_text(series).str.casefold().isin(L2_GROUPS)
@@ -168,17 +308,7 @@ def is_l1_group(series):
     return clean_text(series).str.casefold().isin(L1_GROUPS)
 
 
-def normalize_subcategory(value):
-    if pd.isna(value):
-        return ""
-    return re.sub(r"\s+", " ", str(value).strip().casefold())
-
-
-NORMALIZED_TAT_MAP = {
-    normalize_subcategory(k): v for k, v in TAT_DAYS_BY_SUBCATEGORY.items()
-}
-
-def prepare_data(raw):
+def prepare_data(raw, tat_map):
     df = raw.copy()
 
     for c in ["Ticket ID","Group","Status","Created time","Closed time",
@@ -228,7 +358,7 @@ def prepare_data(raw):
     # Sub-category based TAT from the user's SLA sheet, not a fixed
     # 48-hour threshold.
     df["_SubCategoryKey"] = clean_text(df["Sub-Category"]).apply(normalize_subcategory)
-    df["_TATDays"] = df["_SubCategoryKey"].map(NORMALIZED_TAT_MAP)
+    df["_TATDays"] = df["_SubCategoryKey"].map(tat_map)
     df["_TATHours"] = df["_TATDays"] * 24
     df["_TATStatus"] = "TAT Not Mapped"
 
@@ -1108,10 +1238,10 @@ def l1_created_to_l2_table(data):
     ).reset_index(drop=True) if rows else pd.DataFrame(columns=cols)
 
 
-def excel_bytes(raw, l2):
+def excel_bytes(raw, l2, tat_map):
     # Excel report functions use prepared/internal columns such as _Group,
     # _ClosedLike and _CurrentAgeHours. Prepare the full dump first.
-    full = prepare_data(raw)
+    full = prepare_data(raw, tat_map)
     from openpyxl import load_workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     
@@ -1179,10 +1309,10 @@ def excel_bytes(raw, l2):
         issue_breakup_table(l2, "Sub-Category").to_excel(writer,index=False,sheet_name="Subcategory Breakup")
         subcategory_tat_performance_table(l2).to_excel(writer,index=False,sheet_name="Subcategory TAT Performance")
         category_subcategory_table(l2).to_excel(writer,index=False,sheet_name="Category + Subcategory")
-        other_group_pending_table(full).to_excel(writer,index=False,sheet_name="Other Groups Pending")
-        other_group_open_breakup_table(full).to_excel(writer,index=False,sheet_name="Other Open Breakup")
-        other_group_open_agent_breakup_table(full).to_excel(writer,index=False,sheet_name="Other Open Agent Breakup")
-        other_group_open_category_breakup_table(full).to_excel(writer,index=False,sheet_name="Other Open Category")
+        other_group_pending_table(full).to_excel(writer,index=False,sheet_name="Current Group Pending")
+        other_group_open_breakup_table(full).to_excel(writer,index=False,sheet_name="Current Group Open Breakup")
+        other_group_open_agent_breakup_table(full).to_excel(writer,index=False,sheet_name="Current Group Open Agent Breakup")
+        other_group_open_category_breakup_table(full).to_excel(writer,index=False,sheet_name="Current Group Open Category")
         agent_summary_table(l2).to_excel(writer,index=False,sheet_name="Agent Summary")
         agent_ticket_detail_table(l2).to_excel(writer,index=False,sheet_name="Agent Ticket Detail")
         l1_agent_table(full).to_excel(writer,index=False,sheet_name="CD L1 Agent Summary")
@@ -1190,10 +1320,10 @@ def excel_bytes(raw, l2):
         fcr_l1_table(full).to_excel(writer,index=False,sheet_name="CD L1 FCR Proxy")
         l1_created_to_l2_table(full).to_excel(writer,index=False,sheet_name="L1 to L2 Handoff Proxy")
         other_group_agent_pending_table(full).to_excel(
-            writer,index=False,sheet_name="Other Group Agent Pending"
+            writer,index=False,sheet_name="Current Group Agent Pending"
         )
         other_group_ticket_detail_table(full).to_excel(
-            writer,index=False,sheet_name="Other Group Ticket Detail"
+            writer,index=False,sheet_name="Current Group Ticket Detail"
         )
         group_aging_table(full).to_excel(writer,index=False,sheet_name="All Groups Aging")
         resolution_by_group(full).to_excel(writer,index=False,sheet_name="All Groups Resolution")
@@ -1296,7 +1426,19 @@ if missing:
     st.error("The file is missing required columns: " + ", ".join(missing))
     st.stop()
 
-df=prepare_data(raw)
+tat_info, tat_error = get_tat_data()
+
+if tat_info is None:
+    st.error("### Live TAT sheet could not be loaded")
+    st.error(tat_error)
+    st.info(
+        "The dashboard is intentionally stopped here so it never falls back "
+        "to an old/hard-coded TAT list."
+    )
+    st.stop()
+
+tat_map = tat_info["map"]
+df=prepare_data(raw, tat_map)
 
 # ============================================================
 # FILTERS
@@ -1422,6 +1564,18 @@ st.caption(
 if l2.empty:
     st.warning("No L2 tickets match the selected filters.")
     st.stop()
+
+
+st.markdown('<div class="section">HOW TO READ THIS DASHBOARD</div>', unsafe_allow_html=True)
+st.info(
+    "1) Main L2 KPIs = current tickets in CD L2, Ops - L2, CD - Seller Support, Tech Support and Logistics. "
+    "2) TAT is taken live from the Google Sheet by Sub-Category. "
+    "3) Closed Within TAT / Closed Beyond TAT compare resolution time with that ticket's mapped TAT. "
+    "4) Open Beyond TAT compares current age with that ticket's mapped TAT. "
+    "5) Current Group tables always show the exact raw Group name. "
+    "6) L1 → L2 is a CreatedBy proxy only; this dump does not contain historical transfer history. "
+    "7) TAT Compliance % = Closed Within TAT ÷ (Closed Within TAT + Closed Beyond TAT)."
+)
 
 # ============================================================
 # CD L1 — INTAKE / SAME-DAY / HANDOFF
@@ -1673,21 +1827,21 @@ with r1[3]: kpi("TAT MAPPED / UNMAPPED",f"{m['tat_mapped']:,} / {m['tat_unmapped
 r2=st.columns(4)
 with r2[0]: kpi("CLOSED WITHIN TAT",f"{m['closed_within_tat']:,}","green","Closed within the mapped Sub-category TAT")
 with r2[1]: kpi("CLOSED BEYOND TAT",f"{m['closed_beyond_tat']:,}","orange","Closed after the mapped Sub-category TAT")
-with r2[2]: kpi("TAT COMPLIANCE %",f"{m['tat_compliance_pct']:.1f}%","blue","Closed within TAT ÷ total tickets raised")
+with r2[2]: kpi("TAT COMPLIANCE %",f"{m['tat_compliance_pct']:.1f}%","blue","Closed within TAT ÷ TAT-eligible closed/resolved tickets")
 with r2[3]: kpi("OPEN / PENDING BEYOND TAT",f"{m['open_beyond_tat']:,}","red","Current age is beyond the mapped Sub-category TAT")
 
-with st.popover("🔎 VIEW OPEN / PENDING BREAKUP IN OTHER GROUPS"):
-    st.markdown("### Other Groups — Open / Pending Breakup")
-    st.caption("Current Group is outside the configured L2 bucket. This is a current-state view after the selected Month / Week / Day / Status / Category filters.")
+with st.popover("🔎 VIEW CURRENT NON-L2 GROUP OPEN / PENDING BREAKUP"):
+    st.markdown("### Current Non-L2 Group — Open / Pending Breakup")
+    st.caption("This view shows the exact current Group names that are outside the five configured L2 groups (CD L2, Ops - L2, CD - Seller Support, Tech Support, Logistics), after the selected filters.")
     other_open_all = filtered_all[~filtered_all["_IsL2"] & ~filtered_all["_ClosedLike"]].copy()
     og_total = unique_ticket_count(other_open_all)
     og_open = unique_ticket_count(other_open_all[other_open_all["_Status"].eq("OPEN")])
     og_pending = unique_ticket_count(other_open_all[other_open_all["_Status"].eq("PENDING")])
     og_pending_brand = unique_ticket_count(other_open_all[other_open_all["_Status"].eq("PENDING FROM BRAND")])
     c1,c2,c3,c4 = st.columns(4)
-    with c1: kpi("OTHER GROUP UNRESOLVED", f"{og_total:,}", "red", "Open + Pending + other unresolved statuses")
-    with c2: kpi("OTHER GROUP OPEN", f"{og_open:,}", "orange")
-    with c3: kpi("OTHER GROUP PENDING", f"{og_pending:,}", "blue")
+    with c1: kpi("CURRENT NON-L2 UNRESOLVED", f"{og_total:,}", "red", "Open + Pending + other unresolved statuses")
+    with c2: kpi("CURRENT NON-L2 OPEN", f"{og_open:,}", "orange")
+    with c3: kpi("CURRENT NON-L2 PENDING", f"{og_pending:,}", "blue")
     with c4: kpi("PENDING FROM BRAND", f"{og_pending_brand:,}", "orange")
     st.markdown("**By Current Group**")
     st.dataframe(other_group_open_breakup_table(filtered_all), use_container_width=True, hide_index=True)
@@ -1727,12 +1881,22 @@ st.caption(
 # TAT MAPPING
 # ============================================================
 st.markdown('<div class="section">SUB-CATEGORY TAT MAPPING</div>',unsafe_allow_html=True)
-tat_map_df = pd.DataFrame(
-    [(k.title(), v) for k,v in TAT_DAYS_BY_SUBCATEGORY.items()],
-    columns=["Sub-Category", "TAT (Days)"]
-).sort_values("Sub-Category").reset_index(drop=True)
-st.dataframe(tat_map_df,use_container_width=True,hide_index=True)
-st.caption(f"TAT mapped for {m['tat_mapped']:,} of {m['raised']:,} L2 tickets in the selected population; {m['tat_unmapped']:,} ticket(s) have a Sub-category without a mapping.")
+tat_map_df = tat_info["table"].copy().sort_values("Subcategory").reset_index(drop=True)
+st.dataframe(tat_map_df, use_container_width=True, hide_index=True)
+st.caption(
+    f"Live source: Google Sheet | {tat_info['rows']:,} TAT rows | "
+    f"{tat_info['mapped_rows']:,} sub-categories with numeric TAT | "
+    f"{tat_info['rows'] - tat_info['mapped_rows']:,} rows with NA/non-numeric TAT."
+)
+if tat_info["duplicate_subcategories"]:
+    st.warning(
+        f"The live TAT sheet contains {tat_info['duplicate_subcategories']} "
+        "duplicate sub-category key(s). The last populated TAT is used for ticket matching."
+    )
+st.caption(
+    f"Ticket mapping in the selected L2 population: {m['tat_mapped']:,} mapped tickets and "
+    f"{m['tat_unmapped']:,} unmapped tickets. No fixed 48-hour SLA is used."
+)
 
 st.markdown('<div class="section">SUB-CATEGORY-WISE TAT PERFORMANCE</div>',unsafe_allow_html=True)
 st.dataframe(
@@ -1766,7 +1930,7 @@ st.dataframe(cs_tbl, use_container_width=True, hide_index=True)
 # ============================================================
 # OTHER GROUP / PENDING VIEW
 # ============================================================
-st.markdown('<div class="section">CURRENT TICKETS IN OTHER GROUPS</div>',unsafe_allow_html=True)
+st.markdown('<div class="section">CURRENT NON-L2 GROUP TICKETS</div>',unsafe_allow_html=True)
 st.caption(
     "Based only on the raw Group column. L2 remains the main dashboard "
     "population. This separate view shows tickets currently sitting in any "
@@ -1798,7 +1962,7 @@ st.dataframe(agent_detail, use_container_width=True, hide_index=True)
 # OTHER GROUP — AGENT LEVEL PENDING WORKLOAD
 # ============================================================
 st.markdown(
-    '<div class="section">OTHER GROUPS — AGENT-WISE PENDING TICKETS</div>',
+    '<div class="section">CURRENT NON-L2 GROUP — AGENT-WISE PENDING TICKETS</div>',
     unsafe_allow_html=True
 )
 st.caption(
@@ -1809,7 +1973,7 @@ other_agent_tbl = other_group_agent_pending_table(filtered_all)
 st.dataframe(other_agent_tbl, use_container_width=True, hide_index=True)
 
 st.markdown(
-    '<div class="section">OTHER GROUPS — PENDING TICKET DETAIL</div>',
+    '<div class="section">CURRENT NON-L2 GROUP — PENDING TICKET DETAIL</div>',
     unsafe_allow_html=True
 )
 other_detail_tbl = other_group_ticket_detail_table(filtered_all)
@@ -1881,7 +2045,7 @@ st.caption(
 )
 
 try:
-    xlsx=excel_bytes(raw,l2)
+    xlsx=excel_bytes(raw,l2,tat_map)
     st.download_button(
         "⬇️ Download L2 Analysis Excel",
         data=xlsx,
