@@ -782,6 +782,90 @@ def issue_breakup_table(data, column, denominator=None):
     return out
 
 
+
+def tat_status_breakup_table(data, group_label="Current Group"):
+    """Category/Sub-category TAT status breakdown for any population."""
+    x = data.copy()
+    for c in ["Category", "Sub-Category"]:
+        if c not in x.columns:
+            x[c] = ""
+        x[c] = clean_text(x[c]).replace("", "(blank)")
+
+    if x.empty:
+        return pd.DataFrame(columns=[
+            group_label, "Category", "Sub-Category", "TAT",
+            "Tickets", "TAT Mapped", "TAT Unmapped",
+            "Open / Pending", "Open Within TAT", "Open Beyond TAT",
+            "Closed / Resolved", "Closed Within TAT", "TAT Breached",
+            "TAT Compliance %"
+        ])
+
+    rows = []
+    for (cat, sub), g in x.groupby(["Category", "Sub-Category"], sort=False):
+        tat_vals = g["_TATDays"].dropna().unique()
+        tat_label = f"{int(tat_vals[0])} days" if len(tat_vals) else "Not mapped"
+
+        mapped = g["_TATHours"].notna()
+        open_g = g[~g["_ClosedLike"]]
+        closed_g = g[g["_ClosedLike"]]
+
+        open_within = unique_ticket_count(
+            g[g["_TATStatus"].eq("Open Within TAT")]
+        )
+        open_beyond = unique_ticket_count(
+            g[g["_TATStatus"].eq("Open Beyond TAT")]
+        )
+        closed_within = unique_ticket_count(
+            g[g["_TATStatus"].eq("Closed Within TAT")]
+        )
+        closed_beyond = unique_ticket_count(
+            g[g["_TATStatus"].eq("Closed Beyond TAT")]
+        )
+        eligible = closed_within + closed_beyond
+
+        rows.append({
+            "Category": cat,
+            "Sub-Category": sub,
+            "TAT": tat_label,
+            "Tickets": unique_ticket_count(g),
+            "TAT Mapped": unique_ticket_count(g[mapped]),
+            "TAT Unmapped": unique_ticket_count(g[~mapped]),
+            "Open / Pending": unique_ticket_count(open_g),
+            "Open Within TAT": open_within,
+            "Open Beyond TAT": open_beyond,
+            "Closed / Resolved": unique_ticket_count(closed_g),
+            "Closed Within TAT": closed_within,
+            "TAT Breached": closed_beyond,
+            "TAT Compliance %": round(safe_pct(closed_within, eligible), 1) if eligible else np.nan,
+        })
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(
+            ["TAT Breached", "Open Beyond TAT", "Tickets"],
+            ascending=False
+        )
+        .reset_index(drop=True)
+    )
+
+
+def tat_status_summary_table(data):
+    """Simple population-level TAT status summary."""
+    m = metrics(data)
+    return pd.DataFrame([
+        {"TAT Metric": "Total Tickets", "Tickets": m["raised"], "% of Tickets": 100.0 if m["raised"] else 0.0},
+        {"TAT Metric": "TAT Mapped", "Tickets": m["tat_mapped"], "% of Tickets": round(safe_pct(m["tat_mapped"], m["raised"]), 1)},
+        {"TAT Metric": "TAT Unmapped", "Tickets": m["tat_unmapped"], "% of Tickets": round(safe_pct(m["tat_unmapped"], m["raised"]), 1)},
+        {"TAT Metric": "Open / Pending", "Tickets": m["open"], "% of Tickets": round(safe_pct(m["open"], m["raised"]), 1)},
+        {"TAT Metric": "Open Within TAT", "Tickets": unique_ticket_count(data[data["_TATStatus"].eq("Open Within TAT")]), "% of Tickets": round(safe_pct(unique_ticket_count(data[data["_TATStatus"].eq("Open Within TAT")]), m["raised"]), 1)},
+        {"TAT Metric": "Open Beyond TAT", "Tickets": m["open_beyond_tat"], "% of Tickets": round(safe_pct(m["open_beyond_tat"], m["raised"]), 1)},
+        {"TAT Metric": "Closed / Resolved", "Tickets": m["closed"], "% of Tickets": round(safe_pct(m["closed"], m["raised"]), 1)},
+        {"TAT Metric": "Closed Within TAT", "Tickets": m["closed_within_tat"], "% of Tickets": round(safe_pct(m["closed_within_tat"], m["raised"]), 1)},
+        {"TAT Metric": "TAT Breached", "Tickets": m["closed_beyond_tat"], "% of Tickets": round(safe_pct(m["closed_beyond_tat"], m["raised"]), 1)},
+    ])
+
+
+
 def category_subcategory_table(data):
     cols = ["Category", "Sub-Category"]
     x = data.copy()
@@ -1347,6 +1431,8 @@ def excel_bytes(raw, l2, tat_map):
         aging_table(l2).to_excel(writer,index=False,sheet_name="Ticket Aging")
         open_reason_table(l2).to_excel(writer,index=False,sheet_name="Open Reasons")
         issue_breakup_table(l2, "Category").to_excel(writer,index=False,sheet_name="Category Breakup")
+        tat_status_summary_table(l2).to_excel(writer,index=False,sheet_name="L2 TAT Summary")
+        tat_status_breakup_table(l2).to_excel(writer,index=False,sheet_name="L2 Category Subcat TAT")
         issue_breakup_table(l2, "Sub-Category").to_excel(writer,index=False,sheet_name="Subcategory Breakup")
         subcategory_tat_performance_table(l2).to_excel(writer,index=False,sheet_name="Subcategory TAT Performance")
         category_subcategory_table(l2).to_excel(writer,index=False,sheet_name="Category + Subcategory")
@@ -1354,6 +1440,8 @@ def excel_bytes(raw, l2, tat_map):
         other_group_open_breakup_table(full).to_excel(writer,index=False,sheet_name="Current Group Open Breakup")
         other_group_open_agent_breakup_table(full).to_excel(writer,index=False,sheet_name="Current Group Open Agent Breakup")
         other_group_open_category_breakup_table(full).to_excel(writer,index=False,sheet_name="Current Group Open Category")
+        non_l2_excel = full[~full["_IsL2"]].copy()
+        tat_status_summary_table(non_l2_excel).to_excel(writer,index=False,sheet_name="Non-L2 TAT Summary")
         agent_summary_table(l2).to_excel(writer,index=False,sheet_name="Agent Summary")
         agent_ticket_detail_table(l2).to_excel(writer,index=False,sheet_name="Agent Ticket Detail")
         l1_agent_table(full).to_excel(writer,index=False,sheet_name="CD L1 Agent Summary")
@@ -1861,6 +1949,50 @@ if all_agents:
         )
 
 # ============================================================
+# SECTION 1 — L2 TICKETS DATA
+# ============================================================
+st.markdown('<div class="section">SECTION 1 — L2 TICKETS DATA</div>', unsafe_allow_html=True)
+st.caption(
+    "This section contains only the current L2 groups: CD L2, Ops - L2, "
+    "CD - Seller Support, Tech Support and Logistics. TAT is mapped from the "
+    "live Google Sheet using Sub-Category."
+)
+
+l2_tat = metrics(l2)
+l2c1,l2c2,l2c3,l2c4,l2c5,l2c6 = st.columns(6)
+with l2c1: kpi("L2 TICKETS", f"{l2_tat['raised']:,}", "blue")
+with l2c2: kpi("TAT MAPPED", f"{l2_tat['tat_mapped']:,}", "dark")
+with l2c3: kpi("TAT UNMAPPED", f"{l2_tat['tat_unmapped']:,}", "orange")
+with l2c4: kpi("OPEN / PENDING", f"{l2_tat['open']:,}", "red")
+with l2c5: kpi("CLOSED WITHIN TAT", f"{l2_tat['closed_within_tat']:,}", "green")
+with l2c6: kpi("TAT BREACHED", f"{l2_tat['closed_beyond_tat']:,}", "red")
+
+st.markdown("**L2 — TAT Status Summary**")
+st.dataframe(
+    tat_status_summary_table(l2),
+    use_container_width=True,
+    hide_index=True
+)
+
+st.markdown("**L2 — Category + Sub-Category + TAT Status**")
+st.caption(
+    "Every row shows the mapped TAT and the complete ticket breakup: mapped/unmapped, "
+    "open within/beyond TAT, closed within TAT and TAT breached."
+)
+st.dataframe(
+    tat_status_breakup_table(l2),
+    use_container_width=True,
+    hide_index=True
+)
+
+with st.expander("📋 L2 — Full Ticket-Level Data"):
+    st.dataframe(
+        agent_ticket_detail_table(l2),
+        use_container_width=True,
+        hide_index=True
+    )
+
+# ============================================================
 # SUMMARY
 # ============================================================
 m=metrics(l2)
@@ -2026,6 +2158,97 @@ st.markdown(
 )
 other_detail_tbl = other_group_ticket_detail_table(filtered_all)
 st.dataframe(other_detail_tbl, use_container_width=True, hide_index=True)
+
+# ============================================================
+# SECTION 2 — NON-L2 / OTHER GROUPS
+# ============================================================
+st.markdown('<div class="section">SECTION 2 — NON-L2 / OTHER GROUPS</div>', unsafe_allow_html=True)
+st.caption(
+    "This section contains every ticket whose current raw Group is NOT one of "
+    "the five L2 groups. The exact Group name is retained. TAT is still mapped "
+    "from Sub-Category so you can see mapped, unmapped, open, closed, within TAT "
+    "and breached tickets for these groups as well."
+)
+
+non_l2 = filtered_all[~filtered_all["_IsL2"]].copy()
+non_l2_m = metrics(non_l2)
+
+n1,n2,n3,n4,n5,n6 = st.columns(6)
+with n1: kpi("NON-L2 TICKETS", f"{non_l2_m['raised']:,}", "blue", "All exact current Groups outside L2")
+with n2: kpi("TAT MAPPED", f"{non_l2_m['tat_mapped']:,}", "dark")
+with n3: kpi("TAT UNMAPPED", f"{non_l2_m['tat_unmapped']:,}", "orange")
+with n4: kpi("OPEN / PENDING", f"{non_l2_m['open']:,}", "red")
+with n5: kpi("CLOSED WITHIN TAT", f"{non_l2_m['closed_within_tat']:,}", "green")
+with n6: kpi("TAT BREACHED", f"{non_l2_m['closed_beyond_tat']:,}", "red")
+
+st.markdown("**Non-L2 / Other Groups — TAT Status Summary**")
+st.dataframe(
+    tat_status_summary_table(non_l2),
+    use_container_width=True,
+    hide_index=True
+)
+
+st.markdown("**Non-L2 / Other Groups — Exact Group + Category + Sub-Category + TAT**")
+st.caption(
+    "Use this table to identify exactly which current Group, Category and "
+    "Sub-Category has mapped/unmapped TAT, open workload, closed-within-TAT "
+    "tickets and TAT breaches."
+)
+
+non_l2_detail = tat_status_breakup_table(non_l2)
+if not non_l2_detail.empty:
+    # Add exact current Group by recomputing at Group + Category + Sub-Category level.
+    rows = []
+    for (grp, cat, sub), g in non_l2.groupby(
+        ["_Group", "Category", "Sub-Category"], sort=False
+    ):
+        g = g.copy()
+        cat = str(cat).strip() or "(blank)"
+        sub = str(sub).strip() or "(blank)"
+        tat_vals = g["_TATDays"].dropna().unique()
+        tat_label = f"{int(tat_vals[0])} days" if len(tat_vals) else "Not mapped"
+        mapped = g["_TATHours"].notna()
+        within_open = g["_TATStatus"].eq("Open Within TAT")
+        beyond_open = g["_TATStatus"].eq("Open Beyond TAT")
+        within_closed = g["_TATStatus"].eq("Closed Within TAT")
+        breached = g["_TATStatus"].eq("Closed Beyond TAT")
+        cw = unique_ticket_count(g[within_closed])
+        cb = unique_ticket_count(g[breached])
+        rows.append({
+            "Current Group": grp,
+            "Category": cat,
+            "Sub-Category": sub,
+            "TAT": tat_label,
+            "Tickets": unique_ticket_count(g),
+            "TAT Mapped": unique_ticket_count(g[mapped]),
+            "TAT Unmapped": unique_ticket_count(g[~mapped]),
+            "Open / Pending": unique_ticket_count(g[~g["_ClosedLike"]]),
+            "Open Within TAT": unique_ticket_count(g[within_open]),
+            "Open Beyond TAT": unique_ticket_count(g[beyond_open]),
+            "Closed / Resolved": unique_ticket_count(g[g["_ClosedLike"]]),
+            "Closed Within TAT": cw,
+            "TAT Breached": cb,
+            "TAT Compliance %": round(safe_pct(cw, cw + cb), 1) if cw + cb else np.nan,
+        })
+    non_l2_group_detail = pd.DataFrame(rows).sort_values(
+        ["TAT Breached", "Open Beyond TAT", "Tickets"],
+        ascending=False
+    ).reset_index(drop=True)
+else:
+    non_l2_group_detail = pd.DataFrame()
+
+st.dataframe(
+    non_l2_group_detail,
+    use_container_width=True,
+    hide_index=True
+)
+
+with st.expander("📋 Non-L2 / Other Groups — Full Ticket-Level Data"):
+    st.dataframe(
+        other_group_ticket_detail_table(filtered_all),
+        use_container_width=True,
+        hide_index=True
+    )
 
 # ============================================================
 # TICKET AGING
