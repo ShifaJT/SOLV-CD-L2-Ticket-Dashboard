@@ -2,4 +2,6 @@ streamlit
 pandas
 numpy
 openpyxl
-xlrd
+requests
+gspread
+google-auth
