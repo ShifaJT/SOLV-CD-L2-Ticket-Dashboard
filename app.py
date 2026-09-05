@@ -130,24 +130,21 @@ L1_GROUPS = {
     "no group",
 }
 
+
 # ============================================================
-# LIVE TAT SOURCE — GOOGLE SHEET
+# LIVE TAT SOURCE — PRIVATE GOOGLE SHEET
 # ============================================================
-# The dashboard reads the current TAT sheet at runtime.
-# Google Sheet from the user's screenshot:
-# Spreadsheet ID: 1WONn8c8JQjmVYYYpt06jA-DUzH7YkroE4IxHoMO-TqM
-# Sheet/tab: gid=0
+# The Sheet stays private. The service-account email must have Viewer access.
+# Streamlit Secrets:
 #
-# Expected columns:
-#   Subcategory
-#   SLA effective Jun'25
+# GOOGLE_SERVICE_ACCOUNT_JSON = '''
+# { entire downloaded Google service-account JSON }
+# '''
 #
-# If the sheet is private, add GOOGLE_SERVICE_ACCOUNT_JSON to
-# Streamlit Secrets. If it is publicly readable, the CSV export
-# works without credentials.
+# No hard-coded TAT list and NO fixed 48-hour SLA are used.
 
 GOOGLE_TAT_SHEET_ID = "1WONn8c8JQjmVYYYpt06jA-DUzH7YkroE4IxHoMO-TqM"
-GOOGLE_TAT_GID = "0"
+GOOGLE_TAT_GID = 0
 
 def normalize_subcategory(value):
     if pd.isna(value):
@@ -158,75 +155,128 @@ def normalize_subcategory(value):
     s = re.sub(r"[^a-z0-9]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
-def _read_tat_public_csv():
-    import requests
-    url = (
-        f"https://docs.google.com/spreadsheets/d/"
-        f"{GOOGLE_TAT_SHEET_ID}/export?format=csv&gid={GOOGLE_TAT_GID}"
-    )
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    if not r.text.strip():
-        raise ValueError("The Google TAT sheet returned an empty response.")
-    return pd.read_csv(io.StringIO(r.text))
-
-def _read_tat_from_service_account():
-    # Optional private-sheet support through Streamlit Secrets.
+def _service_account_info():
     import json
-    import gspread
+    raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if raw:
+        if isinstance(raw, str):
+            return json.loads(raw)
+        return dict(raw)
+
+    if "google_service_account" in st.secrets:
+        return dict(st.secrets["google_service_account"])
+
+    raise RuntimeError(
+        "GOOGLE_SERVICE_ACCOUNT_JSON is missing from Streamlit Secrets."
+    )
+
+def _google_token():
     from google.oauth2.service_account import Credentials
+    from google.auth.transport.requests import Request
 
-    secret = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not secret:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not configured.")
+    info = _service_account_info()
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ],
+    )
+    creds.refresh(Request())
+    return creds.token, info.get("client_email", "")
 
-    if isinstance(secret, str):
-        info = json.loads(secret)
-    else:
-        info = dict(secret)
+def _google_get(url, token, params=None):
+    import requests
+    r = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    if not r.ok:
+        try:
+            detail = r.json().get("error", {})
+            message = detail.get("message", r.text)
+            reason = detail.get("status", "")
+            raise RuntimeError(
+                f"Google API HTTP {r.status_code}: {message}"
+                + (f" [{reason}]" if reason else "")
+            )
+        except ValueError:
+            raise RuntimeError(
+                f"Google API HTTP {r.status_code}: {r.text[:1000]}"
+            )
+    return r.json()
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(GOOGLE_TAT_SHEET_ID)
-    ws = sh.get_worksheet_by_id(int(GOOGLE_TAT_GID))
-    return pd.DataFrame(ws.get_all_records())
+def _read_private_tat_sheet():
+    from urllib.parse import quote
+
+    token, service_email = _google_token()
+    base = "https://sheets.googleapis.com/v4/spreadsheets"
+
+    # First call confirms access and finds the exact tab by gid.
+    meta = _google_get(
+        f"{base}/{GOOGLE_TAT_SHEET_ID}",
+        token,
+        params={
+            "fields": "spreadsheetId,properties(title),sheets(properties(sheetId,title))"
+        },
+    )
+
+    target = None
+    for sheet in meta.get("sheets", []):
+        props = sheet.get("properties", {})
+        if int(props.get("sheetId", -1)) == GOOGLE_TAT_GID:
+            target = props
+            break
+
+    if target is None:
+        available = [
+            f"{x.get('properties', {}).get('title')} "
+            f"(gid={x.get('properties', {}).get('sheetId')})"
+            for x in meta.get("sheets", [])
+        ]
+        raise RuntimeError(
+            f"Spreadsheet is accessible, but gid={GOOGLE_TAT_GID} was not found. "
+            f"Available tabs: {', '.join(available)}"
+        )
+
+    title = target.get("title", "")
+    if not title:
+        raise RuntimeError("Google returned the sheet without a tab title.")
+
+    range_name = quote(f"'{title}'!A:B", safe="")
+    values = _google_get(
+        f"{base}/{GOOGLE_TAT_SHEET_ID}/values/{range_name}",
+        token,
+        params={"majorDimension": "ROWS"},
+    ).get("values", [])
+
+    if not values:
+        raise RuntimeError(f"Google Sheet tab '{title}' returned no data.")
+
+    headers = [str(x).strip() for x in values[0]]
+    if len(headers) < 2:
+        raise RuntimeError(
+            f"Google Sheet tab '{title}' must contain at least two columns."
+        )
+
+    rows = []
+    for row in values[1:]:
+        row = list(row) + [""] * (len(headers) - len(row))
+        rows.append(row[:len(headers)])
+
+    return pd.DataFrame(rows, columns=headers), service_email, title
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_live_tat_sheet():
-    errors = []
+    raw_tat, service_email, tab_title = _read_private_tat_sheet()
 
-    # First try the public CSV export.
-    try:
-        raw_tat = _read_tat_public_csv()
-    except Exception as e:
-        errors.append(f"Public Google Sheet CSV export: {e}")
-        raw_tat = None
-
-    # If public export fails, try a service account configured in Secrets.
-    if raw_tat is None:
-        try:
-            raw_tat = _read_tat_from_service_account()
-        except Exception as e:
-            errors.append(f"Service-account access: {e}")
-
-    if raw_tat is None:
-        raise RuntimeError(
-            "Could not read the live TAT Google Sheet. "
-            "Make the sheet accessible to the Streamlit app or configure "
-            "GOOGLE_SERVICE_ACCOUNT_JSON in Streamlit Secrets. "
-            + " | ".join(errors)
-        )
-
-    # Clean column names.
     raw_tat.columns = [str(c).strip() for c in raw_tat.columns]
 
     sub_col = next(
         (c for c in raw_tat.columns if normalize_subcategory(c) == "subcategory"),
-        None
+        None,
     )
     sla_col = next(
         (
@@ -237,36 +287,30 @@ def load_live_tat_sheet():
                 "sla effective jun 2025",
             }
         ),
-        None
+        None,
     )
 
     if sub_col is None or sla_col is None:
-        raise ValueError(
-            "TAT sheet must contain 'Subcategory' and "
-            "'SLA effective Jun'25' columns. "
-            f"Found columns: {list(raw_tat.columns)}"
+        raise RuntimeError(
+            "Google Sheet connected, but required columns were not found. "
+            "Expected: Subcategory and SLA effective Jun'25. "
+            f"Found: {list(raw_tat.columns)}"
         )
 
     tat = raw_tat[[sub_col, sla_col]].copy()
     tat.columns = ["Subcategory", "TAT Raw"]
-
     tat["Subcategory"] = clean_text(tat["Subcategory"])
+
+    # Handles 3, 3 days, 10, 10 days, etc.; NA stays unmapped.
     tat["TAT Numeric"] = pd.to_numeric(
-        tat["TAT Raw"].astype(str).str.strip().replace(
-            {"NA": np.nan, "N/A": np.nan, "na": np.nan, "n/a": np.nan, "": np.nan}
-        ),
-        errors="coerce"
+        tat["TAT Raw"].astype(str)
+        .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
+        errors="coerce",
     )
     tat["_Key"] = tat["Subcategory"].apply(normalize_subcategory)
-
-    # Ignore blank rows. If duplicate sub-categories exist, keep the last
-    # populated numeric TAT and expose the duplicate count to the UI.
     tat = tat[tat["_Key"].ne("")].copy()
 
-    duplicate_keys = (
-        tat[tat["_Key"].duplicated(keep=False)]["_Key"]
-        .value_counts()
-    )
+    duplicate_keys = tat[tat["_Key"].duplicated(keep=False)]["_Key"].value_counts()
     duplicate_count = int((duplicate_keys > 1).sum())
 
     populated = tat[tat["TAT Numeric"].notna()].copy()
@@ -276,8 +320,6 @@ def load_live_tat_sheet():
         .to_dict()
     )
 
-    # Keep the full mapping table exactly as represented in the source,
-    # including NA TAT rows.
     display = tat[["Subcategory", "TAT Raw"]].copy()
     display["TAT (Days)"] = tat["TAT Numeric"].apply(
         lambda x: f"{int(x)} days" if pd.notna(x) else "NA"
@@ -293,6 +335,8 @@ def load_live_tat_sheet():
             f"https://docs.google.com/spreadsheets/d/"
             f"{GOOGLE_TAT_SHEET_ID}/edit?gid={GOOGLE_TAT_GID}"
         ),
+        "service_email": service_email,
+        "tab_title": tab_title,
     }
 
 def get_tat_data():
@@ -377,9 +421,6 @@ def prepare_data(raw, tat_map):
     )
     df.loc[open_valid_tat & (df["_CurrentAgeHours"] <= df["_TATHours"]), "_TATStatus"] = "Open Within TAT"
     df.loc[open_valid_tat & (df["_CurrentAgeHours"] > df["_TATHours"]), "_TATStatus"] = "Open Beyond TAT"
-
-    # Backward-compatible label for downloads; dashboard logic now uses TAT.
-    df["_SLA48"] = df["_TATStatus"]
 
     # Aging buckets for current open/pending workload.
     df["_AgingBucket"] = "Closed / Resolved"
@@ -1433,12 +1474,19 @@ if tat_info is None:
     st.error(tat_error)
     st.info(
         "The dashboard is intentionally stopped here so it never falls back "
-        "to an old/hard-coded TAT list."
+        "to an old or hard-coded TAT list. Check that the service-account email "
+        "has Viewer access, Google Sheets API is enabled, and the complete JSON "
+        "key is present in Streamlit Secrets."
     )
     st.stop()
 
 tat_map = tat_info["map"]
 df=prepare_data(raw, tat_map)
+
+st.success(
+    f"✅ Live TAT connected — Google Sheet tab: {tat_info['tab_title']} | "
+    f"Service account: {tat_info['service_email']}"
+)
 
 # ============================================================
 # FILTERS
@@ -1884,7 +1932,7 @@ st.markdown('<div class="section">SUB-CATEGORY TAT MAPPING</div>',unsafe_allow_h
 tat_map_df = tat_info["table"].copy().sort_values("Subcategory").reset_index(drop=True)
 st.dataframe(tat_map_df, use_container_width=True, hide_index=True)
 st.caption(
-    f"Live source: Google Sheet | {tat_info['rows']:,} TAT rows | "
+    f"Live source: Google Sheet tab '{tat_info['tab_title']}' | {tat_info['rows']:,} TAT rows | "
     f"{tat_info['mapped_rows']:,} sub-categories with numeric TAT | "
     f"{tat_info['rows'] - tat_info['mapped_rows']:,} rows with NA/non-numeric TAT."
 )
