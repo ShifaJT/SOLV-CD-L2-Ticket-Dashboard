@@ -107,6 +107,147 @@ def kpi(label, value, colour="blue", sub=""):
 def safe_pct(num, den):
     return (num / den * 100) if den else 0.0
 
+def clickable_kpi(label, value, colour="blue", key=None):
+    """A KPI-looking Streamlit button. Returns True when clicked."""
+    if "ticket_view" not in st.session_state:
+        st.session_state["ticket_view"] = None
+
+    st.markdown(
+        f"""
+        <style>
+        div[data-testid="stButton"] button[kind="secondary"] {{
+            min-height: 112px;
+            width: 100%;
+            border-radius: 12px;
+            border: 0;
+            box-shadow: 0 4px 12px rgba(0,0,0,.08);
+            text-align: left;
+            padding: 15px 18px;
+            font-weight: 800;
+            white-space: pre-line;
+            background: #2f75b5;
+            color: white;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    return st.button(
+        f"{label}\n\n{value}\n\nClick to view ticket dump",
+        key=key or f"kpi_{label}",
+        use_container_width=True,
+    )
+
+def ticket_dump_table(data):
+    """Ticket-level evidence table used by clickable KPI cards."""
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    x = data.copy()
+    out = pd.DataFrame(index=x.index)
+
+    def col(name, default=""):
+        return clean_text(x[name]) if name in x.columns else pd.Series(default, index=x.index)
+
+    out["Ticket ID"] = col("Ticket ID")
+    out["Status"] = col("Status")
+    out["Priority"] = col("Priority")
+    out["Source / Customer Channel"] = col("Source")
+    out["Agent"] = col("Agent").replace("", "Not provided")
+    out["Current Group"] = col("_Group")
+    out["Created Time"] = pd.to_datetime(x["_Created"], errors="coerce").dt.strftime("%d %b %Y %H:%M:%S")
+    out["Closed Time"] = pd.to_datetime(x["_Closed"], errors="coerce").dt.strftime("%d %b %Y %H:%M:%S")
+    out["Category"] = col("Category").replace("", "(blank)")
+    out["Sub-Category"] = col("Sub-Category").replace("", "(blank)")
+    out["TAT"] = x["_TATDays"].apply(
+        lambda v: f"{int(v)} days" if pd.notna(v) else "Not mapped"
+    )
+    out["TAT Status"] = x["_TATStatus"]
+    out["Resolution Time"] = x["_ResolutionHours"].apply(format_hms)
+    out["Current Age"] = x["_CurrentAgeHours"].apply(format_hms)
+    out["Current Age Days"] = x["_CurrentAgeHours"].apply(
+        lambda v: "—" if pd.isna(v) else f"{v/24:.1f} days"
+    )
+    out["Reason for Pendency"] = col("Reason for pendency").replace(
+        "", "Reason not provided"
+    )
+    out["CreatedBy"] = col("CreatedBy")
+    return out.reset_index(drop=True)
+
+def show_selected_ticket_dump(filtered_data, section_name="L2"):
+    """Show the ticket evidence selected by a KPI card."""
+    selected = st.session_state.get("ticket_view")
+    if not selected:
+        return
+
+    labels = {
+        "l2_all": "L2 — All Tickets",
+        "l2_mapped": "L2 — TAT Mapped Tickets",
+        "l2_unmapped": "L2 — TAT Unmapped Tickets",
+        "l2_open": "L2 — Open / Pending Tickets",
+        "l2_closed_within": "L2 — Closed Within TAT",
+        "l2_breached": "L2 — TAT Breached",
+        "nonl2_all": "Non-L2 / Other Groups — All Tickets",
+        "nonl2_mapped": "Non-L2 / Other Groups — TAT Mapped Tickets",
+        "nonl2_unmapped": "Non-L2 / Other Groups — TAT Unmapped Tickets",
+        "nonl2_open": "Non-L2 / Other Groups — Open / Pending Tickets",
+        "nonl2_closed_within": "Non-L2 / Other Groups — Closed Within TAT",
+        "nonl2_breached": "Non-L2 / Other Groups — TAT Breached",
+    }
+
+    if selected == "l2_all":
+        subset = filtered_data[filtered_data["_IsL2"]].copy()
+    elif selected == "l2_mapped":
+        subset = filtered_data[filtered_data["_IsL2"] & filtered_data["_TATHours"].notna()].copy()
+    elif selected == "l2_unmapped":
+        subset = filtered_data[filtered_data["_IsL2"] & filtered_data["_TATHours"].isna()].copy()
+    elif selected == "l2_open":
+        subset = filtered_data[filtered_data["_IsL2"] & ~filtered_data["_ClosedLike"]].copy()
+    elif selected == "l2_closed_within":
+        subset = filtered_data[filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Within TAT")].copy()
+    elif selected == "l2_breached":
+        subset = filtered_data[filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Beyond TAT")].copy()
+    elif selected == "nonl2_all":
+        subset = filtered_data[~filtered_data["_IsL2"]].copy()
+    elif selected == "nonl2_mapped":
+        subset = filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATHours"].notna()].copy()
+    elif selected == "nonl2_unmapped":
+        subset = filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATHours"].isna()].copy()
+    elif selected == "nonl2_open":
+        subset = filtered_data[~filtered_data["_IsL2"] & ~filtered_data["_ClosedLike"]].copy()
+    elif selected == "nonl2_closed_within":
+        subset = filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Within TAT")].copy()
+    elif selected == "nonl2_breached":
+        subset = filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Beyond TAT")].copy()
+    else:
+        return
+
+    st.markdown(
+        f'<div class="section">🔎 {labels.get(selected, "Selected Ticket Dump")}</div>',
+        unsafe_allow_html=True
+    )
+    st.caption(
+        f"Showing {unique_ticket_count(subset):,} ticket(s) behind the selected KPI. "
+        "The table is based on the same filters applied to the dashboard."
+    )
+
+    dump = ticket_dump_table(subset)
+    st.dataframe(dump, use_container_width=True, hide_index=True)
+
+    csv_bytes = dump.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download selected ticket dump (CSV)",
+        data=csv_bytes,
+        file_name=f"{selected}_ticket_dump.csv",
+        mime="text/csv",
+        key=f"download_{selected}",
+    )
+
+    if st.button("✖ Clear selected ticket dump", key="clear_ticket_view"):
+        st.session_state["ticket_view"] = None
+        st.rerun()
+
+
 # ============================================================
 # DATA PREPARATION
 # ============================================================
@@ -1704,7 +1845,7 @@ if l2.empty:
 
 st.markdown('<div class="section">HOW TO READ THIS DASHBOARD</div>', unsafe_allow_html=True)
 st.info(
-    "1) Main L2 KPIs = current tickets in CD L2, Ops - L2, CD - Seller Support, Tech Support and Logistics. "
+    "1) Main L2 KPIs = current tickets in CD L2, Ops - L2, CD - Seller Support, Tech Support and Logistics. Click a KPI to see its ticket dump. "
     "2) TAT is taken live from the Google Sheet by Sub-Category. "
     "3) Closed Within TAT / Closed Beyond TAT compare resolution time with that ticket's mapped TAT. "
     "4) Open Beyond TAT compares current age with that ticket's mapped TAT. "
@@ -1740,20 +1881,30 @@ q5,q6,q7,q8 = st.columns(4)
 with q5:
     kpi("L1 OPEN / PENDING", f"{l1a['l1_open']:,}", "red")
 with q6:
-    kpi("L1 SAME-DAY PHONE PROXY", f"{l1a['same_day_phone_proxy']:,}", "green",
-        "Phone + same-day close; not proven FCR")
-with q7:
     kpi("CD L1 AGENT COUNT", f"{l1a['l1']['Agent'].nunique():,}", "blue")
+with q7:
+    kpi("PHONE TICKETS", f"{unique_ticket_count(l1a['l1'][clean_text(l1a['l1']['Source']).str.casefold().eq('phone')]):,}", "green",
+        "Customer called and raised the complaint")
 with q8:
-    kpi("L1 FRESH UNASSIGNED <48H", f"{l1a['l1_fresh_unassigned']:,}", "orange",
-        "Open/pending + no agent + age <48h")
+    kpi("CHAT + EMAIL TICKETS", f"{unique_ticket_count(l1a['l1'][clean_text(l1a['l1']['Source']).str.casefold().isin(['chat','email'])]):,}", "orange",
+        "Customer contacted via Freshchat / Email")
+
+st.markdown("**CD L1 — CUSTOMER CONTACT CHANNEL**")
+channel_l1 = issue_breakup_table(l1a["l1"], "Source")
+channel_l1 = channel_l1.rename(columns={"Source": "Customer Contact Channel"})
+channel_l1["Meaning"] = channel_l1["Customer Contact Channel"].astype(str).str.casefold().map({
+    "phone": "Customer called and raised a complaint",
+    "chat": "Customer contacted us through Freshchat",
+    "email": "Customer raised an email",
+    "social media": "Customer contacted us through social media",
+    "inbound": "Inbound interaction recorded in the raw dump",
+}).fillna("Meaning to be confirmed from raw source")
+st.dataframe(channel_l1, use_container_width=True, hide_index=True)
 
 st.caption(
-    "Important: the raw dump contains the current Group only. Therefore "
-    "\"Currently in L2\" is a current-state count, not proof of historical "
-    "movement from CD L1 to L2. A true FCR cannot be proven because this "
-    "dump does not contain Call ID/contact history; the same-day Phone number "
-    "is shown only as an operational proxy."
+    "Channel definitions used in this dashboard: Phone = customer called; "
+    "Chat = customer contacted us through Freshchat; Email = customer raised an email. "
+    "Same-day closure is not labelled FCR because the raw dump does not contain contact-history/Call ID data."
 )
 
 st.markdown(
@@ -1865,18 +2016,15 @@ l1_fresh_unassigned = l1_unassigned[
     (l1_unassigned["_CurrentAgeHours"] < 48)
 ]
 
-l1q1,l1q2,l1q3,l1q4=st.columns(4)
+l1q1,l1q2,l1q3=st.columns(3)
 with l1q1:
     kpi("L1 TICKETS", f"{l1_total:,}", "blue")
 with l1q2:
     kpi("L1 OPEN / PENDING", f"{l1_open:,}", "red")
 with l1q3:
-    kpi("L1 FRESH & UNASSIGNED <48H", f"{unique_ticket_count(l1_fresh_unassigned):,}", "orange")
-with l1q4:
-    kpi("L1 → L2 HANDOFF PROXY", f"{l1_l2_proxy_count(filtered_all):,}", "green",
-        "Current L2 + CreatedBy also seen in current L1")
+    kpi("L1 AGENTS", f"{l1['Agent'].nunique():,}", "blue")
 
-st.markdown("**L1-created / current-L2 proxy by Created By**")
+st.markdown("**L1-created / current-L2 CreatedBy analysis**")
 st.dataframe(
     l1_created_to_l2_table(filtered_all),
     use_container_width=True,
@@ -1959,13 +2107,31 @@ st.caption(
 )
 
 l2_tat = metrics(l2)
-l2c1,l2c2,l2c3,l2c4,l2c5,l2c6 = st.columns(6)
-with l2c1: kpi("L2 TICKETS", f"{l2_tat['raised']:,}", "blue")
-with l2c2: kpi("TAT MAPPED", f"{l2_tat['tat_mapped']:,}", "dark")
-with l2c3: kpi("TAT UNMAPPED", f"{l2_tat['tat_unmapped']:,}", "orange")
-with l2c4: kpi("OPEN / PENDING", f"{l2_tat['open']:,}", "red")
-with l2c5: kpi("CLOSED WITHIN TAT", f"{l2_tat['closed_within_tat']:,}", "green")
-with l2c6: kpi("TAT BREACHED", f"{l2_tat['closed_beyond_tat']:,}", "red")
+
+st.markdown("**Click any KPI below to see the exact ticket dump behind the number.**")
+l2c1,l2c2,l2c3 = st.columns(3)
+with l2c1:
+    if clickable_kpi("L2 TICKETS", f"{l2_tat['raised']:,}", "blue", "click_l2_all"):
+        st.session_state["ticket_view"] = "l2_all"
+with l2c2:
+    if clickable_kpi("TAT MAPPED", f"{l2_tat['tat_mapped']:,}", "dark", "click_l2_mapped"):
+        st.session_state["ticket_view"] = "l2_mapped"
+with l2c3:
+    if clickable_kpi("TAT UNMAPPED", f"{l2_tat['tat_unmapped']:,}", "orange", "click_l2_unmapped"):
+        st.session_state["ticket_view"] = "l2_unmapped"
+
+l2c4,l2c5,l2c6 = st.columns(3)
+with l2c4:
+    if clickable_kpi("OPEN / PENDING", f"{l2_tat['open']:,}", "red", "click_l2_open"):
+        st.session_state["ticket_view"] = "l2_open"
+with l2c5:
+    if clickable_kpi("CLOSED WITHIN TAT", f"{l2_tat['closed_within_tat']:,}", "green", "click_l2_closed"):
+        st.session_state["ticket_view"] = "l2_closed_within"
+with l2c6:
+    if clickable_kpi("TAT BREACHED", f"{l2_tat['closed_beyond_tat']:,}", "red", "click_l2_breached"):
+        st.session_state["ticket_view"] = "l2_breached"
+
+show_selected_ticket_dump(filtered_all, "L2")
 
 st.markdown("**L2 — TAT Status Summary**")
 st.dataframe(
@@ -2173,13 +2339,29 @@ st.caption(
 non_l2 = filtered_all[~filtered_all["_IsL2"]].copy()
 non_l2_m = metrics(non_l2)
 
-n1,n2,n3,n4,n5,n6 = st.columns(6)
-with n1: kpi("NON-L2 TICKETS", f"{non_l2_m['raised']:,}", "blue", "All exact current Groups outside L2")
-with n2: kpi("TAT MAPPED", f"{non_l2_m['tat_mapped']:,}", "dark")
-with n3: kpi("TAT UNMAPPED", f"{non_l2_m['tat_unmapped']:,}", "orange")
-with n4: kpi("OPEN / PENDING", f"{non_l2_m['open']:,}", "red")
-with n5: kpi("CLOSED WITHIN TAT", f"{non_l2_m['closed_within_tat']:,}", "green")
-with n6: kpi("TAT BREACHED", f"{non_l2_m['closed_beyond_tat']:,}", "red")
+n1,n2,n3 = st.columns(3)
+with n1:
+    if clickable_kpi("NON-L2 / OTHER GROUPS", f"{non_l2_m['raised']:,}", "blue", "click_nonl2_all"):
+        st.session_state["ticket_view"] = "nonl2_all"
+with n2:
+    if clickable_kpi("TAT MAPPED", f"{non_l2_m['tat_mapped']:,}", "dark", "click_nonl2_mapped"):
+        st.session_state["ticket_view"] = "nonl2_mapped"
+with n3:
+    if clickable_kpi("TAT UNMAPPED", f"{non_l2_m['tat_unmapped']:,}", "orange", "click_nonl2_unmapped"):
+        st.session_state["ticket_view"] = "nonl2_unmapped"
+
+n4,n5,n6 = st.columns(3)
+with n4:
+    if clickable_kpi("OPEN / PENDING", f"{non_l2_m['open']:,}", "red", "click_nonl2_open"):
+        st.session_state["ticket_view"] = "nonl2_open"
+with n5:
+    if clickable_kpi("CLOSED WITHIN TAT", f"{non_l2_m['closed_within_tat']:,}", "green", "click_nonl2_closed"):
+        st.session_state["ticket_view"] = "nonl2_closed_within"
+with n6:
+    if clickable_kpi("TAT BREACHED", f"{non_l2_m['closed_beyond_tat']:,}", "red", "click_nonl2_breached"):
+        st.session_state["ticket_view"] = "nonl2_breached"
+
+show_selected_ticket_dump(filtered_all, "Non-L2")
 
 st.markdown("**Non-L2 / Other Groups — TAT Status Summary**")
 st.dataframe(
