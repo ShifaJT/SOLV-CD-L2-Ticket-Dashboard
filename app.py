@@ -107,39 +107,50 @@ def kpi(label, value, colour="blue", sub=""):
 def safe_pct(num, den):
     return (num / den * 100) if den else 0.0
 
-def clickable_kpi(label, value, colour="blue", key=None):
-    """A KPI-looking Streamlit button. Returns True when clicked."""
-    if "ticket_view" not in st.session_state:
-        st.session_state["ticket_view"] = None
+def clickable_kpi(label, value, colour="blue", key=None, subtext="Click to view details"):
+    """KPI-looking button. Clicking opens a ticket-detail dialog."""
+    colour_map = {
+        "blue": "#337ab7",
+        "dark": "#173f67",
+        "orange": "#f27c2c",
+        "red": "#c90000",
+        "green": "#70ad47",
+    }
+    bg = colour_map.get(colour, colour_map["blue"])
 
     st.markdown(
         f"""
         <style>
-        div[data-testid="stButton"] button[kind="secondary"] {{
-            min-height: 112px;
-            width: 100%;
-            border-radius: 12px;
-            border: 0;
-            box-shadow: 0 4px 12px rgba(0,0,0,.08);
-            text-align: left;
-            padding: 15px 18px;
-            font-weight: 800;
-            white-space: pre-line;
-            background: #2f75b5;
-            color: white;
+        div[data-testid="stButton"] button[data-testid="baseButton-secondary"] {{
+            min-height: 112px !important;
+            width: 100% !important;
+            border-radius: 12px !important;
+            border: 0 !important;
+            box-shadow: 0 4px 12px rgba(0,0,0,.10) !important;
+            text-align: left !important;
+            padding: 12px 18px !important;
+            background: {bg} !important;
+            color: white !important;
+            font-weight: 800 !important;
+            white-space: pre-line !important;
+        }}
+        div[data-testid="stButton"] button[data-testid="baseButton-secondary"]:hover {{
+            filter: brightness(0.95);
+            transform: translateY(-1px);
         }}
         </style>
         """,
         unsafe_allow_html=True
     )
     return st.button(
-        f"{label}\n\n{value}\n\nClick to view ticket dump",
-        key=key or f"kpi_{label}",
+        f"{label}\n\n{value}\n\n{subtext}",
+        key=key,
         use_container_width=True,
     )
 
+
 def ticket_dump_table(data):
-    """Ticket-level evidence table used by clickable KPI cards."""
+    """Ticket-level evidence table for a selected KPI."""
     if data is None or data.empty:
         return pd.DataFrame()
 
@@ -147,7 +158,9 @@ def ticket_dump_table(data):
     out = pd.DataFrame(index=x.index)
 
     def col(name, default=""):
-        return clean_text(x[name]) if name in x.columns else pd.Series(default, index=x.index)
+        if name in x.columns:
+            return clean_text(x[name])
+        return pd.Series(default, index=x.index)
 
     out["Ticket ID"] = col("Ticket ID")
     out["Status"] = col("Status")
@@ -155,8 +168,12 @@ def ticket_dump_table(data):
     out["Source / Customer Channel"] = col("Source")
     out["Agent"] = col("Agent").replace("", "Not provided")
     out["Current Group"] = col("_Group")
-    out["Created Time"] = pd.to_datetime(x["_Created"], errors="coerce").dt.strftime("%d %b %Y %H:%M:%S")
-    out["Closed Time"] = pd.to_datetime(x["_Closed"], errors="coerce").dt.strftime("%d %b %Y %H:%M:%S")
+    out["Created Time"] = pd.to_datetime(
+        x["_Created"], errors="coerce"
+    ).dt.strftime("%d %b %Y %H:%M:%S")
+    out["Closed Time"] = pd.to_datetime(
+        x["_Closed"], errors="coerce"
+    ).dt.strftime("%d %b %Y %H:%M:%S")
     out["Category"] = col("Category").replace("", "(blank)")
     out["Sub-Category"] = col("Sub-Category").replace("", "(blank)")
     out["TAT"] = x["_TATDays"].apply(
@@ -174,754 +191,123 @@ def ticket_dump_table(data):
     out["CreatedBy"] = col("CreatedBy")
     return out.reset_index(drop=True)
 
-def show_selected_ticket_dump(filtered_data, section_name="L2"):
-    """Show the ticket evidence selected by a KPI card."""
-    selected = st.session_state.get("ticket_view")
-    if not selected:
-        return
 
-    labels = {
-        "l2_all": "L2 — All Tickets",
-        "l2_mapped": "L2 — TAT Mapped Tickets",
-        "l2_unmapped": "L2 — TAT Unmapped Tickets",
-        "l2_open": "L2 — Open / Pending Tickets",
-        "l2_closed_within": "L2 — Closed Within TAT",
-        "l2_breached": "L2 — TAT Breached",
-        "nonl2_all": "Non-L2 / Other Groups — All Tickets",
-        "nonl2_mapped": "Non-L2 / Other Groups — TAT Mapped Tickets",
-        "nonl2_unmapped": "Non-L2 / Other Groups — TAT Unmapped Tickets",
-        "nonl2_open": "Non-L2 / Other Groups — Open / Pending Tickets",
-        "nonl2_closed_within": "Non-L2 / Other Groups — Closed Within TAT",
-        "nonl2_breached": "Non-L2 / Other Groups — TAT Breached",
-    }
-
+def get_kpi_ticket_subset(filtered_data, selected):
+    """Return the exact filtered tickets represented by a KPI."""
     if selected == "l2_all":
-        subset = filtered_data[filtered_data["_IsL2"]].copy()
-    elif selected == "l2_mapped":
-        subset = filtered_data[filtered_data["_IsL2"] & filtered_data["_TATHours"].notna()].copy()
-    elif selected == "l2_unmapped":
-        subset = filtered_data[filtered_data["_IsL2"] & filtered_data["_TATHours"].isna()].copy()
-    elif selected == "l2_open":
-        subset = filtered_data[filtered_data["_IsL2"] & ~filtered_data["_ClosedLike"]].copy()
-    elif selected == "l2_closed_within":
-        subset = filtered_data[filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Within TAT")].copy()
-    elif selected == "l2_breached":
-        subset = filtered_data[filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Beyond TAT")].copy()
-    elif selected == "nonl2_all":
-        subset = filtered_data[~filtered_data["_IsL2"]].copy()
-    elif selected == "nonl2_mapped":
-        subset = filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATHours"].notna()].copy()
-    elif selected == "nonl2_unmapped":
-        subset = filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATHours"].isna()].copy()
-    elif selected == "nonl2_open":
-        subset = filtered_data[~filtered_data["_IsL2"] & ~filtered_data["_ClosedLike"]].copy()
-    elif selected == "nonl2_closed_within":
-        subset = filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Within TAT")].copy()
-    elif selected == "nonl2_breached":
-        subset = filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Beyond TAT")].copy()
-    else:
+        return filtered_data[filtered_data["_IsL2"]].copy()
+    if selected == "l2_mapped":
+        return filtered_data[
+            filtered_data["_IsL2"] & filtered_data["_TATHours"].notna()
+        ].copy()
+    if selected == "l2_unmapped":
+        return filtered_data[
+            filtered_data["_IsL2"] & filtered_data["_TATHours"].isna()
+        ].copy()
+    if selected == "l2_open":
+        return filtered_data[
+            filtered_data["_IsL2"] & ~filtered_data["_ClosedLike"]
+        ].copy()
+    if selected == "l2_closed_within":
+        return filtered_data[
+            filtered_data["_IsL2"]
+            & filtered_data["_TATStatus"].eq("Closed Within TAT")
+        ].copy()
+    if selected == "l2_breached":
+        return filtered_data[
+            filtered_data["_IsL2"]
+            & filtered_data["_TATStatus"].eq("Closed Beyond TAT")
+        ].copy()
+
+    if selected == "nonl2_all":
+        return filtered_data[~filtered_data["_IsL2"]].copy()
+    if selected == "nonl2_mapped":
+        return filtered_data[
+            ~filtered_data["_IsL2"] & filtered_data["_TATHours"].notna()
+        ].copy()
+    if selected == "nonl2_unmapped":
+        return filtered_data[
+            ~filtered_data["_IsL2"] & filtered_data["_TATHours"].isna()
+        ].copy()
+    if selected == "nonl2_open":
+        return filtered_data[
+            ~filtered_data["_IsL2"] & ~filtered_data["_ClosedLike"]
+        ].copy()
+    if selected == "nonl2_closed_within":
+        return filtered_data[
+            ~filtered_data["_IsL2"]
+            & filtered_data["_TATStatus"].eq("Closed Within TAT")
+        ].copy()
+    if selected == "nonl2_breached":
+        return filtered_data[
+            ~filtered_data["_IsL2"]
+            & filtered_data["_TATStatus"].eq("Closed Beyond TAT")
+        ].copy()
+
+    return pd.DataFrame()
+
+
+@st.dialog("Ticket Details", width="large")
+def ticket_details_dialog(data, title, selected_key):
+    """Modal window opened by a KPI click."""
+    st.markdown(f"### {title}")
+    count = unique_ticket_count(data)
+    st.caption(
+        f"{count:,} ticket(s) represented by this KPI after the selected "
+        "Month / Week / Day / Status / Category filters."
+    )
+
+    if data.empty:
+        st.info("No tickets are available for this KPI.")
         return
 
-    st.markdown(
-        f'<div class="section">🔎 {labels.get(selected, "Selected Ticket Dump")}</div>',
-        unsafe_allow_html=True
-    )
-    st.caption(
-        f"Showing {unique_ticket_count(subset):,} ticket(s) behind the selected KPI. "
-        "The table is based on the same filters applied to the dashboard."
+    # Quick breakup inside the modal.
+    a, b, c, d = st.columns(4)
+    with a:
+        st.metric("Tickets", f"{count:,}")
+    with b:
+        st.metric(
+            "TAT Mapped",
+            f"{unique_ticket_count(data[data['_TATHours'].notna()]):,}",
+        )
+    with c:
+        st.metric(
+            "Open / Pending",
+            f"{unique_ticket_count(data[~data['_ClosedLike']]):,}",
+        )
+    with d:
+        st.metric(
+            "TAT Breached",
+            f"{unique_ticket_count(data[data['_TATStatus'].eq('Closed Beyond TAT')]):,}",
+        )
+
+    st.markdown("#### Category / Sub-Category Breakup")
+    cat_table = tat_status_breakup_table(data)
+    if not cat_table.empty:
+        st.dataframe(cat_table, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Exact Ticket Dump")
+    dump = ticket_dump_table(data)
+    st.dataframe(
+        dump,
+        use_container_width=True,
+        hide_index=True,
+        height=500,
     )
 
-    dump = ticket_dump_table(subset)
-    st.dataframe(dump, use_container_width=True, hide_index=True)
-
-    csv_bytes = dump.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "⬇️ Download selected ticket dump (CSV)",
-        data=csv_bytes,
-        file_name=f"{selected}_ticket_dump.csv",
+        "⬇️ Download this ticket dump",
+        data=dump.to_csv(index=False).encode("utf-8"),
+        file_name=f"{selected_key}_ticket_dump.csv",
         mime="text/csv",
-        key=f"download_{selected}",
+        key=f"modal_download_{selected_key}",
+        use_container_width=True,
     )
 
-    if st.button("✖ Clear selected ticket dump", key="clear_ticket_view"):
-        st.session_state["ticket_view"] = None
-        st.rerun()
 
-
-# ============================================================
-# DATA PREPARATION
-# ============================================================
-REQUIRED = ["Ticket ID", "Group", "Status", "Created time",
-            "Closed time", "Resolution time (in hrs)"]
-
-
-# ============================================================
-# SOLV GROUP BUCKETS
-# ============================================================
-L2_GROUPS = {
-    "ops - l2",
-    "cd - seller support",
-    "tech support",
-    "logistics",
-    "cd l2",
-}
-
-L1_GROUPS = {
-    "cd l1 team",
-    "no group",
-}
-
-
-# ============================================================
-# LIVE TAT SOURCE — PRIVATE GOOGLE SHEET
-# ============================================================
-# The Sheet stays private. The service-account email must have Viewer access.
-# Streamlit Secrets:
-#
-# GOOGLE_SERVICE_ACCOUNT_JSON = '''
-# { entire downloaded Google service-account JSON }
-# '''
-#
-# No hard-coded TAT list and NO fixed 48-hour SLA are used.
-
-GOOGLE_TAT_SHEET_ID = "1WONn8cJ8QjmVVYYpt06jA-DUzH7YkroE4lxHoMO-TqM"
-GOOGLE_TAT_GID = 0
-
-def normalize_subcategory(value):
-    if pd.isna(value):
-        return ""
-    s = str(value).strip().casefold()
-    s = s.replace("&", " and ")
-    s = re.sub(r"[-–—_/]+", " ", s)
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-def _service_account_info():
-    import json
-    raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if raw:
-        if isinstance(raw, str):
-            return json.loads(raw)
-        return dict(raw)
-
-    if "google_service_account" in st.secrets:
-        return dict(st.secrets["google_service_account"])
-
-    raise RuntimeError(
-        "GOOGLE_SERVICE_ACCOUNT_JSON is missing from Streamlit Secrets."
-    )
-
-def _google_token():
-    from google.oauth2.service_account import Credentials
-    from google.auth.transport.requests import Request
-
-    info = _service_account_info()
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ],
-    )
-    creds.refresh(Request())
-    return creds.token, info.get("client_email", "")
-
-def _google_get(url, token, params=None):
-    import requests
-    r = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params=params or {},
-        timeout=30,
-    )
-    if not r.ok:
-        try:
-            detail = r.json().get("error", {})
-            message = detail.get("message", r.text)
-            reason = detail.get("status", "")
-            raise RuntimeError(
-                f"Google API HTTP {r.status_code}: {message}"
-                + (f" [{reason}]" if reason else "")
-            )
-        except ValueError:
-            raise RuntimeError(
-                f"Google API HTTP {r.status_code}: {r.text[:1000]}"
-            )
-    return r.json()
-
-def _read_private_tat_sheet():
-    from urllib.parse import quote
-
-    token, service_email = _google_token()
-    base = "https://sheets.googleapis.com/v4/spreadsheets"
-
-    # First call confirms access and finds the exact tab by gid.
-    meta = _google_get(
-        f"{base}/{GOOGLE_TAT_SHEET_ID}",
-        token,
-        params={
-            "fields": "spreadsheetId,properties(title),sheets(properties(sheetId,title))"
-        },
-    )
-
-    target = None
-    for sheet in meta.get("sheets", []):
-        props = sheet.get("properties", {})
-        if int(props.get("sheetId", -1)) == GOOGLE_TAT_GID:
-            target = props
-            break
-
-    if target is None:
-        available = [
-            f"{x.get('properties', {}).get('title')} "
-            f"(gid={x.get('properties', {}).get('sheetId')})"
-            for x in meta.get("sheets", [])
-        ]
-        raise RuntimeError(
-            f"Spreadsheet is accessible, but gid={GOOGLE_TAT_GID} was not found. "
-            f"Available tabs: {', '.join(available)}"
-        )
-
-    title = target.get("title", "")
-    if not title:
-        raise RuntimeError("Google returned the sheet without a tab title.")
-
-    range_name = quote(f"'{title}'!A:B", safe="")
-    values = _google_get(
-        f"{base}/{GOOGLE_TAT_SHEET_ID}/values/{range_name}",
-        token,
-        params={"majorDimension": "ROWS"},
-    ).get("values", [])
-
-    if not values:
-        raise RuntimeError(f"Google Sheet tab '{title}' returned no data.")
-
-    headers = [str(x).strip() for x in values[0]]
-    if len(headers) < 2:
-        raise RuntimeError(
-            f"Google Sheet tab '{title}' must contain at least two columns."
-        )
-
-    rows = []
-    for row in values[1:]:
-        row = list(row) + [""] * (len(headers) - len(row))
-        rows.append(row[:len(headers)])
-
-    return pd.DataFrame(rows, columns=headers), service_email, title
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_live_tat_sheet():
-    raw_tat, service_email, tab_title = _read_private_tat_sheet()
-
-    raw_tat.columns = [str(c).strip() for c in raw_tat.columns]
-
-    sub_col = next(
-        (c for c in raw_tat.columns if normalize_subcategory(c) == "subcategory"),
-        None,
-    )
-    sla_col = next(
-        (
-            c for c in raw_tat.columns
-            if normalize_subcategory(c) in {
-                "sla effective jun25",
-                "sla effective jun 25",
-                "sla effective jun 2025",
-            }
-        ),
-        None,
-    )
-
-    if sub_col is None or sla_col is None:
-        raise RuntimeError(
-            "Google Sheet connected, but required columns were not found. "
-            "Expected: Subcategory and SLA effective Jun'25. "
-            f"Found: {list(raw_tat.columns)}"
-        )
-
-    tat = raw_tat[[sub_col, sla_col]].copy()
-    tat.columns = ["Subcategory", "TAT Raw"]
-    tat["Subcategory"] = clean_text(tat["Subcategory"])
-
-    # Handles 3, 3 days, 10, 10 days, etc.; NA stays unmapped.
-    tat["TAT Numeric"] = pd.to_numeric(
-        tat["TAT Raw"].astype(str)
-        .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
-        errors="coerce",
-    )
-    tat["_Key"] = tat["Subcategory"].apply(normalize_subcategory)
-    tat = tat[tat["_Key"].ne("")].copy()
-
-    duplicate_keys = tat[tat["_Key"].duplicated(keep=False)]["_Key"].value_counts()
-    duplicate_count = int((duplicate_keys > 1).sum())
-
-    populated = tat[tat["TAT Numeric"].notna()].copy()
-    tat_map = (
-        populated.drop_duplicates("_Key", keep="last")
-        .set_index("_Key")["TAT Numeric"]
-        .to_dict()
-    )
-
-    display = tat[["Subcategory", "TAT Raw"]].copy()
-    display["TAT (Days)"] = tat["TAT Numeric"].apply(
-        lambda x: f"{int(x)} days" if pd.notna(x) else "NA"
-    )
-
-    return {
-        "map": tat_map,
-        "table": display,
-        "rows": len(display),
-        "mapped_rows": int(populated["_Key"].nunique()),
-        "duplicate_subcategories": duplicate_count,
-        "source_url": (
-            f"https://docs.google.com/spreadsheets/d/"
-            f"{GOOGLE_TAT_SHEET_ID}/edit?gid={GOOGLE_TAT_GID}"
-        ),
-        "service_email": service_email,
-        "tab_title": tab_title,
-    }
-
-def get_tat_data():
-    try:
-        return load_live_tat_sheet(), None
-    except Exception as e:
-        return None, str(e)
-
-def is_l2_group(series):
-    return clean_text(series).str.casefold().isin(L2_GROUPS)
-
-def is_l1_group(series):
-    return clean_text(series).str.casefold().isin(L1_GROUPS)
-
-
-def prepare_data(raw, tat_map):
-    df = raw.copy()
-
-    for c in ["Ticket ID","Group","Status","Created time","Closed time",
-              "Resolution time (in hrs)","Reason for pendency",
-              "Category","Sub-Category","Priority","Type",
-              "Resolution status","First response time (in hrs)",
-              "Agent","SO Helpline_L1","SO Helpline_L2"]:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    df["Ticket ID"] = df["Ticket ID"].astype(str).str.strip()
-    df["_Group"] = clean_text(df["Group"]).replace("", "No Group")
-    df["_Status"] = clean_text(df["Status"]).str.upper()
-
-    df["_IsL2"] = df["_Group"].str.casefold().isin(L2_GROUPS)
-    df["_IsL1"] = df["_Group"].str.casefold().isin(L1_GROUPS)
-
-    # Treat Resolved as closed for resolution/SLA metrics because it has a
-    # resolved state but may not have a Closed time.
-    df["_ClosedLike"] = df["_Status"].isin(["CLOSED", "RESOLVED"])
-
-    df["_Created"] = pd.to_datetime(df["Created time"], errors="coerce")
-    df["_Closed"] = pd.to_datetime(df["Closed time"], errors="coerce")
-
-    # Resolution time: prefer the raw export field.
-    df["_ResolutionHours"] = df["Resolution time (in hrs)"].apply(parse_hms)
-
-    # If a closed/resolved ticket has no usable raw resolution field,
-    # derive elapsed Created -> Closed/Resolved where possible.
-    missing_res = df["_ResolutionHours"].isna() & df["_ClosedLike"] & df["_Created"].notna() & df["_Closed"].notna()
-    df.loc[missing_res, "_ResolutionHours"] = (
-        (df.loc[missing_res, "_Closed"] - df.loc[missing_res, "_Created"])
-        .dt.total_seconds() / 3600
-    )
-
-    df.loc[df["_ResolutionHours"] < 0, "_ResolutionHours"] = np.nan
-
-    # Current age for tickets that are not closed/resolved.
-    now = pd.Timestamp.now()
-    open_like = ~df["_ClosedLike"]
-    df["_CurrentAgeHours"] = np.nan
-    age_mask = open_like & df["_Created"].notna()
-    df.loc[age_mask, "_CurrentAgeHours"] = (
-        (now - df.loc[age_mask, "_Created"]).dt.total_seconds() / 3600
-    ).clip(lower=0)
-
-    # Sub-category based TAT from the user's SLA sheet, not a fixed
-    # 48-hour threshold.
-    df["_SubCategoryKey"] = clean_text(df["Sub-Category"]).apply(normalize_subcategory)
-    df["_TATDays"] = df["_SubCategoryKey"].map(tat_map)
-    df["_TATHours"] = df["_TATDays"] * 24
-    df["_TATStatus"] = "TAT Not Mapped"
-
-    closed_valid_tat = (
-        df["_ClosedLike"] &
-        df["_ResolutionHours"].notna() &
-        df["_TATHours"].notna()
-    )
-    df.loc[closed_valid_tat & (df["_ResolutionHours"] <= df["_TATHours"]), "_TATStatus"] = "Closed Within TAT"
-    df.loc[closed_valid_tat & (df["_ResolutionHours"] > df["_TATHours"]), "_TATStatus"] = "Closed Beyond TAT"
-
-    open_valid_tat = (
-        open_like &
-        df["_CurrentAgeHours"].notna() &
-        df["_TATHours"].notna()
-    )
-    df.loc[open_valid_tat & (df["_CurrentAgeHours"] <= df["_TATHours"]), "_TATStatus"] = "Open Within TAT"
-    df.loc[open_valid_tat & (df["_CurrentAgeHours"] > df["_TATHours"]), "_TATStatus"] = "Open Beyond TAT"
-
-    # Aging buckets for current open/pending workload.
-    df["_AgingBucket"] = "Closed / Resolved"
-    df.loc[open_like & (df["_CurrentAgeHours"] <= 24), "_AgingBucket"] = "0–24h"
-    df.loc[open_like & (df["_CurrentAgeHours"] > 24) & (df["_CurrentAgeHours"] <= 48), "_AgingBucket"] = "24–48h"
-    df.loc[open_like & (df["_CurrentAgeHours"] > 48) & (df["_CurrentAgeHours"] <= 72), "_AgingBucket"] = "48–72h"
-    df.loc[open_like & (df["_CurrentAgeHours"] > 72) & (df["_CurrentAgeHours"] <= 168), "_AgingBucket"] = "3–7 days"
-    df.loc[open_like & (df["_CurrentAgeHours"] > 168) & (df["_CurrentAgeHours"] <= 720), "_AgingBucket"] = "7–30 days"
-    df.loc[open_like & (df["_CurrentAgeHours"] > 720) & (df["_CurrentAgeHours"] <= 2160), "_AgingBucket"] = "30–90 days"
-    df.loc[open_like & (df["_CurrentAgeHours"] > 2160), "_AgingBucket"] = ">90 days"
-
-    df["_CreatedDate"] = df["_Created"].dt.date
-    df["_Month"] = df["_Created"].dt.strftime("%b %Y")
-    df["_MonthSort"] = df["_Created"].dt.to_period("M").astype(str)
-    df["_WeekStart"] = df["_Created"].dt.to_period("W-SUN").apply(lambda p: p.start_time if not pd.isna(p) else pd.NaT)
-    df["_Week"] = np.where(
-        df["_WeekStart"].notna(),
-        df["_WeekStart"].dt.strftime("%d %b %Y"),
-        ""
-    )
-
-    return df
-
-
-def status_is_closed(df):
-    return df["_ClosedLike"]
-
-
-def cd_l1_analysis(data):
-    """CD L1 intake and handoff analysis from the current raw Group snapshot."""
-    l1 = data[
-        data["_Group"].fillna("").astype(str).str.casefold().eq("cd l1 team")
-    ].copy()
-
-    total = unique_ticket_count(l1)
-
-    closed = l1[l1["_ClosedLike"]]
-    created = pd.to_datetime(l1["_Created"], errors="coerce")
-    closed_time = pd.to_datetime(l1["_Closed"], errors="coerce")
-
-    same_day = closed[
-        created.loc[closed.index].dt.date.eq(
-            closed_time.loc[closed.index].dt.date
-        )
-    ]
-
-    # Current L2 is visible in the raw Group field, but the single
-    # snapshot does not contain historical Group movement. Therefore this
-    # metric is explicitly "currently in L2", not a proven movement count.
-    l2_current = data[data["_IsL2"]]
-    handoff_proxy = l1_l2_proxy_count(data)
-
-    l1_open = l1[~l1["_ClosedLike"]]
-    unassigned = clean_text(l1_open["Agent"]).str.casefold().isin(
-        ["", "no agent", "not provided"]
-    )
-    fresh_unassigned = l1_open[
-        unassigned &
-        l1_open["_CurrentAgeHours"].notna() &
-        (l1_open["_CurrentAgeHours"] < 48)
-    ]
-
-    phone_l1_closed = closed[
-        clean_text(closed["Source"]).str.casefold().eq("phone") &
-        created.loc[closed.index].dt.date.eq(
-            closed_time.loc[closed.index].dt.date
-        )
-    ]
-
-    return {
-        "l1_raised": total,
-        "l1_closed_same_day": unique_ticket_count(same_day),
-        "l1_current_l2": unique_ticket_count(l2_current),
-        "l1_l2_handoff_proxy": handoff_proxy,
-        "l1_open": unique_ticket_count(l1_open),
-        "l1_fresh_unassigned": unique_ticket_count(fresh_unassigned),
-        "same_day_phone_proxy": unique_ticket_count(phone_l1_closed),
-        "l1": l1,
-        "fresh_unassigned": fresh_unassigned,
-    }
-
-
-def l1_agent_table(data):
-    a = cd_l1_analysis(data)
-    l1 = a["l1"]
-
-    if l1.empty:
-        return pd.DataFrame(columns=[
-            "Agent","Tickets Raised","Closed / Resolved","Open / Pending",
-            "Closed Same Day","Open <48h & Unassigned","Avg Resolution",
-            "Max Resolution"
-        ])
-
-    rows = []
-    for agent, g in l1.groupby(
-        clean_text(l1["Agent"]).replace("", "No Agent"),
-        sort=False
-    ):
-        r = g.loc[g["_ClosedLike"], "_ResolutionHours"].dropna()
-        created = g["_Created"]
-        closed = g["_Closed"]
-        same_day_count = int(
-            (
-                g["_ClosedLike"] &
-                created.notna() &
-                closed.notna() &
-                created.dt.date.eq(closed.dt.date)
-            ).sum()
-        )
-        open_g = g[~g["_ClosedLike"]]
-        age = open_g["_CurrentAgeHours"].dropna()
-        fresh_unassigned = open_g[
-            clean_text(open_g["Agent"]).str.casefold().isin(
-                ["", "no agent", "not provided"]
-            )
-            & open_g["_CurrentAgeHours"].notna()
-            & (open_g["_CurrentAgeHours"] < 48)
-        ]
-
-        rows.append({
-            "Agent": agent,
-            "Tickets Raised": unique_ticket_count(g),
-            "Closed / Resolved": unique_ticket_count(g[g["_ClosedLike"]]),
-            "Open / Pending": unique_ticket_count(open_g),
-            "Closed Same Day": same_day_count,
-            "Open <48h & Unassigned": unique_ticket_count(fresh_unassigned),
-            "Avg Resolution": format_hms(r.mean()) if len(r) else "—",
-            "Max Resolution": format_hms(r.max()) if len(r) else "—",
-        })
-
-    return pd.DataFrame(rows).sort_values(
-        ["Open <48h & Unassigned", "Tickets Raised"],
-        ascending=False
-    ).reset_index(drop=True)
-
-
-def fcr_l1_table(data):
-    """
-    FCR cannot be proven from this dump because there is no Call ID /
-    contact-history field. Show a transparent same-day Phone proxy only.
-    """
-    a = cd_l1_analysis(data)
-    l1 = a["l1"]
-
-    if l1.empty:
-        return pd.DataFrame(columns=[
-            "Metric","Tickets","Definition"
-        ])
-
-    return pd.DataFrame([
-        [
-            "L1 tickets raised",
-            a["l1_raised"],
-            "Current Group = CD L1 Team / No Group"
-        ],
-        [
-            "L1 closed same day",
-            a["l1_closed_same_day"],
-            "Created date = Closed date"
-        ],
-        [
-            "Same-day Phone resolution proxy",
-            a["same_day_phone_proxy"],
-            "Phone source + closed on the same calendar day; not a proven FCR"
-        ],
-    ])
-
-
-def l1_ticket_detail_table(data):
-    a = cd_l1_analysis(data)
-    x = a["fresh_unassigned"].copy()
-
-    if x.empty:
-        return pd.DataFrame(columns=[
-            "Agent","Group","Ticket ID","Created Date",
-            "Last Updated Date","Aging","Aging Days",
-            "Category","Sub-Category","Status"
-        ])
-
-    out = pd.DataFrame()
-    out["Agent"] = clean_text(x["Agent"]).replace("", "No Agent")
-    out["Group"] = x["_Group"]
-    out["Ticket ID"] = x["Ticket ID"]
-    out["Created Date"] = x["_Created"].dt.strftime("%d %b %Y %H:%M:%S")
-    out["Last Updated Date"] = pd.to_datetime(
-        x["Last update time"], errors="coerce"
-    ).dt.strftime("%d %b %Y %H:%M:%S")
-    out["Aging"] = x["_CurrentAgeHours"].apply(format_hms)
-    out["Aging Days"] = x["_CurrentAgeHours"].apply(
-        lambda h: "—" if pd.isna(h) else f"{h/24:.1f} days"
-    )
-    out["Category"] = clean_text(x["Category"]).replace("", "(blank)")
-    out["Sub-Category"] = clean_text(x["Sub-Category"]).replace("", "(blank)")
-    out["Status"] = x["Status"]
-
-    return out.sort_values(
-        "Aging", ascending=False
-    ).reset_index(drop=True)
-
-
-def metrics(data):
-    raised = unique_ticket_count(data)
-    closed = unique_ticket_count(data[data["_ClosedLike"]])
-    open_n = unique_ticket_count(data[~data["_ClosedLike"]])
-
-    closed_valid = data[data["_ClosedLike"] & data["_ResolutionHours"].notna()]
-    res = closed_valid["_ResolutionHours"]
-
-    closed_within_tat = unique_ticket_count(
-        data[data["_TATStatus"].eq("Closed Within TAT")]
-    )
-    closed_beyond_tat = unique_ticket_count(
-        data[data["_TATStatus"].eq("Closed Beyond TAT")]
-    )
-
-    open_beyond_tat = unique_ticket_count(
-        data[data["_TATStatus"].eq("Open Beyond TAT")]
-    )
-    tat_mapped = int(data["_TATHours"].notna().sum())
-    tat_unmapped = int(data["_TATHours"].isna().sum())
-
-    open_age = data.loc[~data["_ClosedLike"], "_CurrentAgeHours"].dropna()
-    open_gt90 = int((open_age > 2160).sum())
-
-    tat_closed_eligible = closed_within_tat + closed_beyond_tat
-
-    return {
-        "raised": raised,
-        "closed": closed,
-        "open": open_n,
-        "closed_within_tat": closed_within_tat,
-        "closed_beyond_tat": closed_beyond_tat,
-        "tat_compliance_pct": safe_pct(closed_within_tat, tat_closed_eligible),
-        "tat_closed_eligible": tat_closed_eligible,
-        "open_beyond_tat": open_beyond_tat,
-        "tat_mapped": tat_mapped,
-        "tat_unmapped": tat_unmapped,
-        "avg": res.mean() if len(res) else np.nan,
-        "max_resolution": res.max() if len(res) else np.nan,
-        "p90": res.quantile(0.90) if len(res) else np.nan,
-        "p95": res.quantile(0.95) if len(res) else np.nan,
-        "p99": res.quantile(0.99) if len(res) else np.nan,
-        "open_gt90": open_gt90,
-        "max_open_age": open_age.max() if len(open_age) else np.nan,
-        "valid_resolution": len(res),
-    }
-
-def group_aging_table(data):
-    rows = []
-    for group, g in data.groupby("_Group", sort=False):
-        age = g.loc[~g["_ClosedLike"], "_CurrentAgeHours"].dropna()
-        rows.append({
-            "Group": group,
-            "Tickets": unique_ticket_count(g),
-            "Open/Pending": unique_ticket_count(g[~g["_ClosedLike"]]),
-            "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
-            "Open >90 days": int((age > 2160).sum()),
-            "Max Open Age": format_hms(age.max()) if len(age) else "—",
-        })
-    return pd.DataFrame(rows).sort_values("Tickets", ascending=False).reset_index(drop=True)
-
-def subcategory_tat_performance_table(data):
-    """Sub-category level TAT performance with the mapped TAT shown explicitly."""
-    x = data.copy()
-    x["_SubcatDisplay"] = clean_text(x["Sub-Category"]).replace("", "(blank)")
-    rows=[]
-    for sub,g in x.groupby("_SubcatDisplay", sort=False):
-        raised = unique_ticket_count(g)
-        closed = g[g["_ClosedLike"]]
-        eligible_closed = closed[closed["_TATStatus"].isin(["Closed Within TAT","Closed Beyond TAT"])]
-        within = unique_ticket_count(eligible_closed[eligible_closed["_TATStatus"].eq("Closed Within TAT")])
-        beyond = unique_ticket_count(eligible_closed[eligible_closed["_TATStatus"].eq("Closed Beyond TAT")])
-        open_beyond = unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")])
-        tat_vals = g["_TATDays"].dropna().unique()
-        tat_label = f"{int(tat_vals[0])} days" if len(tat_vals) else "Not mapped"
-        rows.append({
-            "Sub-Category": sub,
-            "TAT": tat_label,
-            "Tickets Raised": raised,
-            "Closed / Resolved": unique_ticket_count(closed),
-            "Closed Within TAT": within,
-            "Closed Beyond TAT": beyond,
-            "TAT Compliance %": round(safe_pct(within, within + beyond), 1) if (within + beyond) else np.nan,
-            "Open / Pending": unique_ticket_count(g[~g["_ClosedLike"]]),
-            "Open Beyond TAT": open_beyond,
-        })
-    return pd.DataFrame(rows).sort_values("Tickets Raised", ascending=False).reset_index(drop=True) if rows else pd.DataFrame(columns=[
-        "Sub-Category","TAT","Tickets Raised","Closed / Resolved","Closed Within TAT","Closed Beyond TAT","TAT Compliance %","Open / Pending","Open Beyond TAT"
-    ])
-
-
-def open_reason_table(data):
-    x = data[~data["_ClosedLike"]].copy()
-    if x.empty:
-        return pd.DataFrame(columns=["Open/Pending Reason","Tickets","% of Open/Pending"])
-
-    x["_Reason"] = clean_text(x["Reason for pendency"])
-    x.loc[x["_Reason"].eq(""), "_Reason"] = "Reason not provided"
-
-    out = (
-        x.groupby("_Reason")["Ticket ID"].nunique()
-        .reset_index(name="Tickets")
-        .rename(columns={"_Reason":"Open/Pending Reason"})
-        .sort_values("Tickets", ascending=False)
-        .reset_index(drop=True)
-    )
-    total = out["Tickets"].sum()
-    out["% of Open/Pending"] = (out["Tickets"] / total * 100).round(1) if total else 0
-    return out
-
-def aging_table(data):
-    order = ["0–24h","24–48h","48–72h","3–7 days","7–30 days","30–90 days",">90 days"]
-    x = data[~data["_ClosedLike"]]
-    out = x.groupby("_AgingBucket")["Ticket ID"].nunique().reindex(order, fill_value=0).reset_index()
-    out.columns = ["Current Ticket Age","Tickets"]
-    return out
-
-def resolution_by_group(data):
-    rows=[]
-    for group,g in data.groupby("_Group",sort=False):
-        r=g.loc[g["_ClosedLike"],"_ResolutionHours"].dropna()
-        rows.append({
-            "Group":group,
-            "Closed/Resolved":unique_ticket_count(g[g["_ClosedLike"]]),
-            "Closed Within TAT":unique_ticket_count(g[g["_TATStatus"].eq("Closed Within TAT")]),
-            "Closed Beyond TAT":unique_ticket_count(g[g["_TATStatus"].eq("Closed Beyond TAT")]),
-            "TAT Compliance %":round(
-                safe_pct(
-                    unique_ticket_count(g[g["_TATStatus"].eq("Closed Within TAT")]),
-                    unique_ticket_count(g[g["_TATStatus"].isin(["Closed Within TAT","Closed Beyond TAT"])])
-                ),1
-            ),
-            "Open Beyond TAT":unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
-            "Avg Resolution":format_hms(r.mean()) if len(r) else "—",
-            "Max Resolution":format_hms(r.max()) if len(r) else "—",
-        })
-    return pd.DataFrame(rows).sort_values("Closed/Resolved",ascending=False).reset_index(drop=True)
-
-
-def issue_breakup_table(data, column, denominator=None):
-    x = data.copy()
-    if column not in x.columns:
-        return pd.DataFrame(columns=[column, "Tickets", "% of Tickets"])
-
-    x["_Issue"] = clean_text(x[column])
-    x.loc[x["_Issue"].eq(""), "_Issue"] = "(blank)"
-
-    out = (
-        x.groupby("_Issue")["Ticket ID"].nunique()
-        .reset_index(name="Tickets")
-        .rename(columns={"_Issue": column})
-        .sort_values("Tickets", ascending=False)
-        .reset_index(drop=True)
-    )
-    den = int(denominator if denominator is not None else unique_ticket_count(data))
-    out["% of Tickets"] = (
-        (out["Tickets"] / den * 100).round(1) if den else 0.0
-    )
-    return out
-
+def open_kpi_dialog(filtered_data, selected_key, title):
+    subset = get_kpi_ticket_subset(filtered_data, selected_key)
+    ticket_details_dialog(subset, title, selected_key)
 
 
 def tat_status_breakup_table(data, group_label="Current Group"):
@@ -2108,30 +1494,28 @@ st.caption(
 
 l2_tat = metrics(l2)
 
-st.markdown("**Click any KPI below to see the exact ticket dump behind the number.**")
+st.markdown("**Click any KPI box to open the exact ticket details in a pop-up.**")
 l2c1,l2c2,l2c3 = st.columns(3)
 with l2c1:
     if clickable_kpi("L2 TICKETS", f"{l2_tat['raised']:,}", "blue", "click_l2_all"):
-        st.session_state["ticket_view"] = "l2_all"
+        open_kpi_dialog(filtered_all, "l2_all", "L2 — All Tickets")
 with l2c2:
     if clickable_kpi("TAT MAPPED", f"{l2_tat['tat_mapped']:,}", "dark", "click_l2_mapped"):
-        st.session_state["ticket_view"] = "l2_mapped"
+        open_kpi_dialog(filtered_all, "l2_mapped", "L2 — TAT Mapped Tickets")
 with l2c3:
     if clickable_kpi("TAT UNMAPPED", f"{l2_tat['tat_unmapped']:,}", "orange", "click_l2_unmapped"):
-        st.session_state["ticket_view"] = "l2_unmapped"
+        open_kpi_dialog(filtered_all, "l2_unmapped", "L2 — TAT Unmapped Tickets")
 
 l2c4,l2c5,l2c6 = st.columns(3)
 with l2c4:
     if clickable_kpi("OPEN / PENDING", f"{l2_tat['open']:,}", "red", "click_l2_open"):
-        st.session_state["ticket_view"] = "l2_open"
+        open_kpi_dialog(filtered_all, "l2_open", "L2 — Open / Pending Tickets")
 with l2c5:
     if clickable_kpi("CLOSED WITHIN TAT", f"{l2_tat['closed_within_tat']:,}", "green", "click_l2_closed"):
-        st.session_state["ticket_view"] = "l2_closed_within"
+        open_kpi_dialog(filtered_all, "l2_closed_within", "L2 — Closed Within TAT")
 with l2c6:
     if clickable_kpi("TAT BREACHED", f"{l2_tat['closed_beyond_tat']:,}", "red", "click_l2_breached"):
-        st.session_state["ticket_view"] = "l2_breached"
-
-show_selected_ticket_dump(filtered_all, "L2")
+        open_kpi_dialog(filtered_all, "l2_breached", "L2 — TAT Breached Tickets")
 
 st.markdown("**L2 — TAT Status Summary**")
 st.dataframe(
@@ -2342,26 +1726,24 @@ non_l2_m = metrics(non_l2)
 n1,n2,n3 = st.columns(3)
 with n1:
     if clickable_kpi("NON-L2 / OTHER GROUPS", f"{non_l2_m['raised']:,}", "blue", "click_nonl2_all"):
-        st.session_state["ticket_view"] = "nonl2_all"
+        open_kpi_dialog(filtered_all, "nonl2_all", "Non-L2 / Other Groups — All Tickets")
 with n2:
     if clickable_kpi("TAT MAPPED", f"{non_l2_m['tat_mapped']:,}", "dark", "click_nonl2_mapped"):
-        st.session_state["ticket_view"] = "nonl2_mapped"
+        open_kpi_dialog(filtered_all, "nonl2_mapped", "Non-L2 / Other Groups — TAT Mapped Tickets")
 with n3:
     if clickable_kpi("TAT UNMAPPED", f"{non_l2_m['tat_unmapped']:,}", "orange", "click_nonl2_unmapped"):
-        st.session_state["ticket_view"] = "nonl2_unmapped"
+        open_kpi_dialog(filtered_all, "nonl2_unmapped", "Non-L2 / Other Groups — TAT Unmapped Tickets")
 
 n4,n5,n6 = st.columns(3)
 with n4:
     if clickable_kpi("OPEN / PENDING", f"{non_l2_m['open']:,}", "red", "click_nonl2_open"):
-        st.session_state["ticket_view"] = "nonl2_open"
+        open_kpi_dialog(filtered_all, "nonl2_open", "Non-L2 / Other Groups — Open / Pending Tickets")
 with n5:
     if clickable_kpi("CLOSED WITHIN TAT", f"{non_l2_m['closed_within_tat']:,}", "green", "click_nonl2_closed"):
-        st.session_state["ticket_view"] = "nonl2_closed_within"
+        open_kpi_dialog(filtered_all, "nonl2_closed_within", "Non-L2 / Other Groups — Closed Within TAT")
 with n6:
     if clickable_kpi("TAT BREACHED", f"{non_l2_m['closed_beyond_tat']:,}", "red", "click_nonl2_breached"):
-        st.session_state["ticket_view"] = "nonl2_breached"
-
-show_selected_ticket_dump(filtered_all, "Non-L2")
+        open_kpi_dialog(filtered_all, "nonl2_breached", "Non-L2 / Other Groups — TAT Breached Tickets")
 
 st.markdown("**Non-L2 / Other Groups — TAT Status Summary**")
 st.dataframe(
