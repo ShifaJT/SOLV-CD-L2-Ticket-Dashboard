@@ -875,6 +875,14 @@ def get_kpi_ticket_subset(filtered_data, selected):
         return filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Within TAT")].copy()
     if selected == "nonl2_breached":
         return filtered_data[~filtered_data["_IsL2"] & filtered_data["_TATStatus"].eq("Closed Beyond TAT")].copy()
+
+    if selected.startswith("nonl2_group::"):
+        group_name = selected.split("::", 1)[1]
+        return filtered_data[
+            ~filtered_data["_IsL2"] &
+            filtered_data["_Group"].eq(group_name)
+        ].copy()
+
     return pd.DataFrame()
 
 
@@ -2343,41 +2351,100 @@ non_l2 = filtered_all[~filtered_all["_IsL2"]].copy()
 non_l2_m = metrics(non_l2)
 
 st.markdown("**Click any KPI box to open the exact ticket details in a pop-up.**")
+
+# Overall Non-L2 KPIs
 n1,n2,n3 = st.columns(3)
 with n1:
-    if clickable_kpi("NON-L2 / OTHER GROUPS", f"{non_l2_m['raised']:,}", "blue", "click_nonl2_all"):
-        open_kpi_dialog(filtered_all, "nonl2_all", "Non-L2 / Other Groups — All Tickets")
+    if clickable_kpi("ALL OTHER GROUPS", f"{non_l2_m['raised']:,}", "blue", "click_nonl2_all"):
+        open_kpi_dialog(filtered_all, "nonl2_all", "All Non-L2 / Other Groups — Ticket Details")
 with n2:
-    if clickable_kpi("TAT MAPPED", f"{non_l2_m['tat_mapped']:,}", "dark", "click_nonl2_mapped"):
+    if clickable_kpi("TAT MAPPED — OTHER GROUPS", f"{non_l2_m['tat_mapped']:,}", "dark", "click_nonl2_mapped"):
         open_kpi_dialog(filtered_all, "nonl2_mapped", "Non-L2 / Other Groups — TAT Mapped Tickets")
 with n3:
-    if clickable_kpi("TAT UNMAPPED", f"{non_l2_m['tat_unmapped']:,}", "orange", "click_nonl2_unmapped"):
+    if clickable_kpi("TAT UNMAPPED — OTHER GROUPS", f"{non_l2_m['tat_unmapped']:,}", "orange", "click_nonl2_unmapped"):
         open_kpi_dialog(filtered_all, "nonl2_unmapped", "Non-L2 / Other Groups — TAT Unmapped Tickets")
 
 n4,n5,n6 = st.columns(3)
 with n4:
-    if clickable_kpi("OPEN / PENDING", f"{non_l2_m['open']:,}", "red", "click_nonl2_open"):
+    if clickable_kpi("OPEN / PENDING — OTHER GROUPS", f"{non_l2_m['open']:,}", "red", "click_nonl2_open"):
         open_kpi_dialog(filtered_all, "nonl2_open", "Non-L2 / Other Groups — Open / Pending Tickets")
 with n5:
-    if clickable_kpi("CLOSED WITHIN TAT", f"{non_l2_m['closed_within_tat']:,}", "green", "click_nonl2_closed"):
+    if clickable_kpi("CLOSED WITHIN TAT — OTHER GROUPS", f"{non_l2_m['closed_within_tat']:,}", "green", "click_nonl2_closed"):
         open_kpi_dialog(filtered_all, "nonl2_closed_within", "Non-L2 / Other Groups — Closed Within TAT")
 with n6:
-    if clickable_kpi("TAT BREACHED", f"{non_l2_m['closed_beyond_tat']:,}", "red", "click_nonl2_breached"):
+    if clickable_kpi("TAT BREACHED — OTHER GROUPS", f"{non_l2_m['closed_beyond_tat']:,}", "red", "click_nonl2_breached"):
         open_kpi_dialog(filtered_all, "nonl2_breached", "Non-L2 / Other Groups — TAT Breached Tickets")
 
-st.markdown("**Non-L2 / Other Groups — TAT Status Summary**")
+# Exact current Group breakup
+st.markdown("### CURRENT OTHER GROUPS — ACTUAL GROUP NAMES")
+st.caption(
+    "These are the exact current Group values present in the raw dump outside "
+    "the five configured L2 groups. Click a group to open its complete ticket dump."
+)
+
+other_groups = (
+    non_l2.groupby("_Group")["Ticket ID"]
+    .nunique()
+    .sort_values(ascending=False)
+)
+
+if len(other_groups):
+    group_items = list(other_groups.items())
+    for row_start in range(0, len(group_items), 3):
+        cols = st.columns(3)
+        for col, (group_name, group_count) in zip(cols, group_items[row_start:row_start+3]):
+            safe_key = re.sub(r"[^a-zA-Z0-9_]+", "_", str(group_name)).strip("_").lower() or "blank"
+            with col:
+                if clickable_kpi(
+                    str(group_name),
+                    f"{int(group_count):,}",
+                    "blue",
+                    f"click_nonl2_group_{row_start}_{safe_key}",
+                    "Click to view this group's ticket dump"
+                ):
+                    open_kpi_dialog(
+                        filtered_all,
+                        f"nonl2_group::{group_name}",
+                        f"{group_name} — Ticket Details"
+                    )
+else:
+    st.info("No current non-L2 / Other Groups are present for the selected filters.")
+
+st.markdown("**CURRENT OTHER GROUPS — TAT STATUS SUMMARY**")
 st.dataframe(
     tat_status_summary_table(non_l2),
     use_container_width=True,
     hide_index=True
 )
 
-st.markdown("**Non-L2 / Other Groups — Exact Group + Category + Sub-Category + TAT**")
+st.markdown("**CURRENT OTHER GROUPS — GROUP + CATEGORY + SUB-CATEGORY + TAT**")
 st.caption(
     "Use this table to identify exactly which current Group, Category and "
     "Sub-Category has mapped/unmapped TAT, open workload, closed-within-TAT "
     "tickets and TAT breaches."
 )
+
+st.markdown("**CURRENT GROUP — TAT BREAKUP**")
+group_tat_rows = []
+for group_name, g in non_l2.groupby("_Group", sort=False):
+    group_tat_rows.append({
+        "Current Group": group_name,
+        "Tickets": unique_ticket_count(g),
+        "TAT Mapped": unique_ticket_count(g[g["_TATHours"].notna()]),
+        "TAT Unmapped": unique_ticket_count(g[g["_TATHours"].isna()]),
+        "Open / Pending": unique_ticket_count(g[~g["_ClosedLike"]]),
+        "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
+        "Closed / Resolved": unique_ticket_count(g[g["_ClosedLike"]]),
+        "Closed Within TAT": unique_ticket_count(g[g["_TATStatus"].eq("Closed Within TAT")]),
+        "TAT Breached": unique_ticket_count(g[g["_TATStatus"].eq("Closed Beyond TAT")]),
+    })
+group_tat_df = pd.DataFrame(group_tat_rows)
+if not group_tat_df.empty:
+    group_tat_df = group_tat_df.sort_values(
+        ["TAT Breached", "Open Beyond TAT", "Tickets"],
+        ascending=False
+    ).reset_index(drop=True)
+st.dataframe(group_tat_df, use_container_width=True, hide_index=True)
 
 non_l2_detail = tat_status_breakup_table(non_l2)
 if not non_l2_detail.empty:
