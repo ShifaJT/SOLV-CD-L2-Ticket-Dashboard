@@ -1776,7 +1776,7 @@ def excel_bytes(raw, l2, tat_map):
 # ============================================================
 st.markdown("""
 <div class="hero">
-  <h1>SOLV — L2 TICKET PERFORMANCE & TAT DASHBOARD</h1>
+  <h1>SOLV — L1 & L2 TICKET PERFORMANCE & TAT DASHBOARD</h1>
   <p>L2 bucket health, sub-category TAT, ticket aging, resolution performance and workload drivers.</p>
 </div>
 """, unsafe_allow_html=True)
