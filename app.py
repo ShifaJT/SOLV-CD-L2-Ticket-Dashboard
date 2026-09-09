@@ -1512,6 +1512,64 @@ def l1_created_to_l2_table(data):
     ).reset_index(drop=True) if rows else pd.DataFrame(columns=cols)
 
 
+
+def l2_group_summary_table(l2):
+    """One row per configured L2 group with full TAT/status breakup."""
+    rows = []
+    for group_name, g in l2.groupby("_Group", sort=False):
+        rows.append({
+            "L2 Group": group_name,
+            "Tickets": unique_ticket_count(g),
+            "TAT Mapped": unique_ticket_count(g[g["_TATHours"].notna()]),
+            "TAT Unmapped": unique_ticket_count(g[g["_TATHours"].isna()]),
+            "Open / Pending": unique_ticket_count(g[~g["_ClosedLike"]]),
+            "Open Within TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Within TAT")]),
+            "Open Beyond TAT": unique_ticket_count(g[g["_TATStatus"].eq("Open Beyond TAT")]),
+            "Closed / Resolved": unique_ticket_count(g[g["_ClosedLike"]]),
+            "Closed Within TAT": unique_ticket_count(g[g["_TATStatus"].eq("Closed Within TAT")]),
+            "TAT Breached": unique_ticket_count(g[g["_TATStatus"].eq("Closed Beyond TAT")]),
+        })
+    if not rows:
+        return pd.DataFrame(columns=[
+            "L2 Group","Tickets","TAT Mapped","TAT Unmapped","Open / Pending",
+            "Open Within TAT","Open Beyond TAT","Closed / Resolved",
+            "Closed Within TAT","TAT Breached"
+        ])
+    return pd.DataFrame(rows).sort_values("Tickets", ascending=False).reset_index(drop=True)
+
+
+def l2_dependency_table(l2, group_name):
+    """Detailed dependency view for Logistics / Tech Support."""
+    g = l2[l2["_Group"].eq(group_name)].copy()
+    if g.empty:
+        return pd.DataFrame()
+    rows=[]
+    for (cat, sub), x in g.groupby(["Category","Sub-Category"], sort=False):
+        tat_vals=x["_TATDays"].dropna().unique()
+        tat=f"{int(tat_vals[0])} days" if len(tat_vals) else "Not mapped"
+        rows.append({
+            "Group": group_name,
+            "Category": clean_text(pd.Series([cat])).iloc[0] or "(blank)",
+            "Sub-Category": clean_text(pd.Series([sub])).iloc[0] or "(blank)",
+            "Tickets": unique_ticket_count(x),
+            "TAT": tat,
+            "TAT Mapped": unique_ticket_count(x[x["_TATHours"].notna()]),
+            "TAT Unmapped": unique_ticket_count(x[x["_TATHours"].isna()]),
+            "Open / Pending": unique_ticket_count(x[~x["_ClosedLike"]]),
+            "Open Within TAT": unique_ticket_count(x[x["_TATStatus"].eq("Open Within TAT")]),
+            "Open Beyond TAT": unique_ticket_count(x[x["_TATStatus"].eq("Open Beyond TAT")]),
+            "Closed / Resolved": unique_ticket_count(x[x["_ClosedLike"]]),
+            "Closed Within TAT": unique_ticket_count(x[x["_TATStatus"].eq("Closed Within TAT")]),
+            "TAT Breached": unique_ticket_count(x[x["_TATStatus"].eq("Closed Beyond TAT")]),
+        })
+    return pd.DataFrame(rows).sort_values(
+        ["TAT Breached","Open Beyond TAT","Tickets"], ascending=False
+    ).reset_index(drop=True)
+
+
+def dependency_ticket_dump(l2, group_name):
+    return ticket_dump_table(l2[l2["_Group"].eq(group_name)].copy())
+
 def excel_bytes(raw, l2, tat_map):
     # Excel report functions use prepared/internal columns such as _Group,
     # _ClosedLike and _CurrentAgeHours. Prepare the full dump first.
@@ -1605,6 +1663,49 @@ def excel_bytes(raw, l2, tat_map):
         )
         group_aging_table(full).to_excel(writer,index=False,sheet_name="All Groups Aging")
         resolution_by_group(full).to_excel(writer,index=False,sheet_name="All Groups Resolution")
+
+        # ========================================================
+        # L2 MANAGEMENT PACK — ALL L2 + DEPENDENCY GROUPS
+        # ========================================================
+        l2_group_summary_table(l2).to_excel(
+            writer, index=False, sheet_name="L2 Group Summary"
+        )
+
+        l2_all_export = ticket_dump_table(l2)
+        l2_all_export.to_excel(
+            writer, index=False, sheet_name="L2 All Tickets"
+        )
+
+        l2_open_export = ticket_dump_table(l2[~l2["_ClosedLike"]].copy())
+        l2_open_export.to_excel(
+            writer, index=False, sheet_name="L2 Open Pending"
+        )
+
+        l2_within_export = ticket_dump_table(
+            l2[l2["_TATStatus"].eq("Closed Within TAT")].copy()
+        )
+        l2_within_export.to_excel(
+            writer, index=False, sheet_name="L2 Within TAT"
+        )
+
+        l2_breach_export = ticket_dump_table(
+            l2[l2["_TATStatus"].eq("Closed Beyond TAT")].copy()
+        )
+        l2_breach_export.to_excel(
+            writer, index=False, sheet_name="L2 TAT Breached"
+        )
+
+        for dep_group, sheet_name in [
+            ("Logistics", "Logistics Tickets"),
+            ("Tech Support", "Tech Support Tickets"),
+        ]:
+            dep = l2[l2["_Group"].eq(dep_group)].copy()
+            dependency_ticket_dump(l2, dep_group).to_excel(
+                writer, index=False, sheet_name=sheet_name
+            )
+            l2_dependency_table(l2, dep_group).to_excel(
+                writer, index=False, sheet_name=f"{dep_group[:20]} TAT"
+            )
 
         # Monthly view for L2
         monthly=[]
@@ -2150,6 +2251,49 @@ st.dataframe(
     use_container_width=True,
     hide_index=True
 )
+
+st.markdown("### L2 GROUP SUMMARY")
+st.caption(
+    "All five configured L2 groups are treated as L2. Logistics and Tech Support "
+    "are L2 groups as well; they are shown separately below because they are dependency teams."
+)
+st.dataframe(
+    l2_group_summary_table(l2),
+    use_container_width=True,
+    hide_index=True
+)
+
+st.markdown("### LOGISTICS & TECH SUPPORT — DEPENDENCY VIEW")
+st.caption(
+    "These tickets are still included in the overall L2 numbers above. This separate "
+    "view isolates Logistics and Tech Support so you can see their workload and TAT performance."
+)
+
+dep1, dep2 = st.columns(2)
+for col, dep_group, key in [
+    (dep1, "Logistics", "l2_logistics_dep"),
+    (dep2, "Tech Support", "l2_tech_dep"),
+]:
+    g = l2[l2["_Group"].eq(dep_group)].copy()
+    gm = metrics(g)
+    with col:
+        st.markdown(f"**{dep_group}**")
+        d1,d2,d3,d4 = st.columns(4)
+        with d1: st.metric("Tickets", f"{gm['raised']:,}")
+        with d2: st.metric("Open / Pending", f"{gm['open']:,}")
+        with d3: st.metric("Within TAT", f"{gm['closed_within_tat']:,}")
+        with d4: st.metric("TAT Breached", f"{gm['closed_beyond_tat']:,}")
+        st.dataframe(
+            l2_dependency_table(l2, dep_group),
+            use_container_width=True,
+            hide_index=True
+        )
+        with st.expander(f"📋 {dep_group} — Full Ticket Dump"):
+            st.dataframe(
+                dependency_ticket_dump(l2, dep_group),
+                use_container_width=True,
+                hide_index=True
+            )
 
 st.markdown("**L2 — Category + Sub-Category + TAT Status**")
 st.caption(
